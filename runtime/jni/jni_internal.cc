@@ -2181,6 +2181,9 @@ class JNI {
         // than the whole GC to occur thanks to the to-space invariant.
         heap->IncrementDisableThreadFlip(soa.Self());
       }
+      // Ensure that the string doesn't cause userfaults in case passed on to
+      // the kernel.
+      heap->EnsureObjectUserfaulted(s);
       if (is_copy != nullptr) {
         *is_copy = JNI_FALSE;
       }
@@ -2365,6 +2368,8 @@ class JNI {
       // Re-decode in case the object moved since IncrementDisableGC waits for GC to complete.
       array = soa.Decode<mirror::Array>(java_array);
     }
+    // Ensure that the array doesn't cause userfaults in case passed on to the kernel.
+    heap->EnsureObjectUserfaulted(array);
     if (is_copy != nullptr) {
       *is_copy = JNI_FALSE;
     }
