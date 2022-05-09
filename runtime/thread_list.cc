@@ -1289,6 +1289,10 @@ void ThreadList::Unregister(Thread* self, bool should_run_callbacks) {
   DCHECK_EQ(self, Thread::Current());
   CHECK_NE(self->GetState(), ThreadState::kRunnable);
   Locks::mutator_lock_->AssertNotHeld(self);
+  if (self->tls32_.disable_thread_flip_count != 0) {
+    LOG(FATAL) << "Incomplete PrimitiveArrayCritical section at exit: " << *self << "count = "
+               << self->tls32_.disable_thread_flip_count;
+  }
 
   VLOG(threads) << "ThreadList::Unregister() " << *self;
 
