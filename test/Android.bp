@@ -58,7 +58,11 @@ art_module_cc_defaults {
             cflags: ["-Wno-frame-larger-than="],
         },
         host: {
-            cflags: ["-Wno-frame-larger-than="],
+            cflags: [
+                "-Wno-frame-larger-than=",
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
         },
     },
 }
@@ -205,6 +209,10 @@ art_cc_defaults {
             shared_libs: [
                 "libziparchive",
             ],
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
         },
     },
 }
@@ -328,6 +336,12 @@ art_cc_defaults {
         "libgtest_isolated",
     ],
     target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
         android32: {
             cflags: ["-DART_TARGET_NATIVETEST_DIR=/data/nativetest/art"],
         },
@@ -403,6 +417,12 @@ art_cc_defaults {
         "liblog",
     ],
     target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
         darwin: {
             enabled: false,
         },
