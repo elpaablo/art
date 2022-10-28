@@ -2296,11 +2296,11 @@ void Runtime::DumpForSigQuit(std::ostream& os) {
 }
 
 void Runtime::DumpLockHolders(std::ostream& os) {
-  uint64_t mutator_lock_owner = Locks::mutator_lock_->GetExclusiveOwnerTid();
+  pid_t mutator_lock_owner = Locks::mutator_lock_->GetExclusiveOwnerTid();
   pid_t thread_list_lock_owner = GetThreadList()->GetLockOwner();
   pid_t classes_lock_owner = GetClassLinker()->GetClassesLockOwner();
   pid_t dex_lock_owner = GetClassLinker()->GetDexLockOwner();
-  if ((thread_list_lock_owner | classes_lock_owner | dex_lock_owner) != 0) {
+  if ((mutator_lock_owner | thread_list_lock_owner | classes_lock_owner | dex_lock_owner) != 0) {
     os << "Mutator lock exclusive owner tid: " << mutator_lock_owner << "\n"
        << "ThreadList lock owner tid: " << thread_list_lock_owner << "\n"
        << "ClassLinker classes lock owner tid: " << classes_lock_owner << "\n"
@@ -3358,6 +3358,14 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
                                   const uint8_t* map_begin,
                                   const uint8_t* map_end,
                                   const std::string& file_name) {
+  // Short-circuit the madvise optimization for background processes. This
+  // avoids IO and memory contention with foreground processes, particularly
+  // those involving app startup.
+  const Runtime* runtime = Runtime::Current();
+  if (runtime != nullptr && !runtime->InJankPerceptibleProcessState()) {
+    return;
+  }
+
   // Ideal blockTransferSize for madvising files (128KiB)
   static constexpr size_t kIdealIoTransferSizeBytes = 128*1024;
 

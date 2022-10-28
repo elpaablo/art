@@ -607,8 +607,13 @@ class Dex2Oat final {
   }
 
   void ParseInstructionSetVariant(const std::string& option, ParserOptions* parser_options) {
-    compiler_options_->instruction_set_features_ = InstructionSetFeatures::FromVariant(
-        compiler_options_->instruction_set_, option, &parser_options->error_msg);
+    if (kIsTargetBuild) {
+      compiler_options_->instruction_set_features_ = InstructionSetFeatures::FromVariantAndHwcap(
+          compiler_options_->instruction_set_, option, &parser_options->error_msg);
+    } else {
+      compiler_options_->instruction_set_features_ = InstructionSetFeatures::FromVariant(
+          compiler_options_->instruction_set_, option, &parser_options->error_msg);
+    }
     if (compiler_options_->instruction_set_features_ == nullptr) {
       Usage("%s", parser_options->error_msg.c_str());
     }
@@ -811,6 +816,13 @@ class Dex2Oat final {
     if (compiler_options_->instruction_set_ == kRuntimeISA) {
       std::unique_ptr<const InstructionSetFeatures> runtime_features(
           InstructionSetFeatures::FromCppDefines());
+      if (kRuntimeISA == InstructionSet::kArm64) {
+        std::unique_ptr<const InstructionSetFeatures> arm64_runtime_features(
+        InstructionSetFeatures::FromRuntimeDetection());
+        if (arm64_runtime_features != nullptr) {
+            runtime_features = std::move(arm64_runtime_features);
+        }
+      }
       if (!compiler_options_->GetInstructionSetFeatures()->Equals(runtime_features.get())) {
         LOG(WARNING) << "Mismatch between dex2oat instruction set features to use ("
             << *compiler_options_->GetInstructionSetFeatures()

@@ -224,13 +224,8 @@ class QuickArgumentVisitor {
 #endif
 
  public:
-  // Special handling for proxy methods. Proxy methods are instance methods so the
-  // 'this' object is the 1st argument. They also have the same frame layout as the
-  // kRefAndArgs runtime method. Since 'this' is a reference, it is located in the
-  // 1st GPR.
-  static StackReference<mirror::Object>* GetProxyThisObjectReference(ArtMethod** sp)
+  static StackReference<mirror::Object>* GetThisObjectReference(ArtMethod** sp)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    CHECK((*sp)->IsProxyMethod());
     CHECK_GT(kNumQuickGprArgs, 0u);
     constexpr uint32_t kThisGprIndex = 0u;  // 'this' is in the 1st GPR.
     size_t this_arg_offset = kQuickCalleeSaveFrame_RefAndArgs_Gpr1Offset +
@@ -529,7 +524,8 @@ class QuickArgumentVisitor {
 // allows to use the QuickArgumentVisitor constants without moving all the code in its own module.
 extern "C" mirror::Object* artQuickGetProxyThisObject(ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return QuickArgumentVisitor::GetProxyThisObjectReference(sp)->AsMirrorPtr();
+  DCHECK((*sp)->IsProxyMethod());
+  return QuickArgumentVisitor::GetThisObjectReference(sp)->AsMirrorPtr();
 }
 
 // Visits arguments on the stack placing them into the shadow frame.
@@ -654,7 +650,10 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
   ScopedQuickEntrypointChecks sqec(self);
 
   if (UNLIKELY(!method->IsInvokable())) {
-    method->ThrowInvocationTimeError();
+    method->ThrowInvocationTimeError(
+        method->IsStatic()
+            ? nullptr
+            : QuickArgumentVisitor::GetThisObjectReference(sp)->AsMirrorPtr());
     return 0;
   }
 
@@ -2653,12 +2652,18 @@ extern "C" uint64_t artInvokeCustom(uint32_t call_site_idx, Thread* self, ArtMet
 extern "C" void artMethodEntryHook(ArtMethod* method, Thread* self, ArtMethod** sp ATTRIBUTE_UNUSED)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
-  instr->MethodEnterEvent(self, method);
-  if (instr->IsDeoptimized(method)) {
-    // Instrumentation can request deoptimizing only a particular method (for
-    // ex: when there are break points on the method). In such cases deoptimize
-    // only this method. FullFrame deoptimizations are handled on method exits.
-    artDeoptimizeFromCompiledCode(DeoptimizationKind::kDebugging, self);
+  if (instr->HasMethodEntryListeners()) {
+    instr->MethodEnterEvent(self, method);
+    // MethodEnter callback could have requested a deopt for ex: by setting a breakpoint, so
+    // check if we need a deopt here.
+    if (instr->IsDeoptimized(method)) {
+      // Instrumentation can request deoptimizing only a particular method (for ex: when
+      // there are break points on the method). In such cases deoptimize only this method.
+      // FullFrame deoptimizations are handled on method exits.
+      artDeoptimizeFromCompiledCode(DeoptimizationKind::kDebugging, self);
+    }
+  } else {
+    DCHECK(!instr->IsDeoptimized(method));
   }
 }
 

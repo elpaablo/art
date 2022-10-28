@@ -1732,112 +1732,113 @@ bool ClassLinker::OpenImageDexFiles(gc::space::ImageSpace* space,
 
 // Helper class for ArtMethod checks when adding an image. Keeps all required functionality
 // together and caches some intermediate results.
+template <PointerSize kPointerSize>
 class ImageChecker final {
  public:
-  static void CheckObjects(gc::Heap* heap, ClassLinker* class_linker)
+  static void CheckObjects(gc::Heap* heap, gc::space::ImageSpace* space)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    ImageChecker ic(heap, class_linker);
+    // There can be no GC during boot image initialization, so we do not need read barriers.
+    ScopedDebugDisallowReadBarriers sddrb(Thread::Current());
+
+    CHECK_EQ(kPointerSize, space->GetImageHeader().GetPointerSize());
+    const ImageSection& objects_section = space->GetImageHeader().GetObjectsSection();
+    uintptr_t space_begin = reinterpret_cast<uintptr_t>(space->Begin());
+    uintptr_t objects_begin = space_begin + objects_section.Offset();
+    uintptr_t objects_end = objects_begin + objects_section.Size();
+    ImageChecker ic(heap);
     auto visitor = [&](mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
       DCHECK(obj != nullptr);
-      CHECK(obj->GetClass() != nullptr) << "Null class in object " << obj;
-      CHECK(obj->GetClass()->GetClass() != nullptr) << "Null class class " << obj;
-      if (obj->IsClass()) {
+      mirror::Class* obj_klass = obj->GetClass<kDefaultVerifyFlags, kWithoutReadBarrier>();
+      CHECK(obj_klass != nullptr) << "Null class in object " << obj;
+      mirror::Class* class_class = obj_klass->GetClass<kDefaultVerifyFlags, kWithoutReadBarrier>();
+      CHECK(class_class != nullptr) << "Null class class " << obj;
+      if (obj_klass == class_class) {
         auto klass = obj->AsClass();
         for (ArtField& field : klass->GetIFields()) {
-          CHECK_EQ(field.GetDeclaringClass(), klass);
+          CHECK_EQ(field.GetDeclaringClass<kWithoutReadBarrier>(), klass);
         }
         for (ArtField& field : klass->GetSFields()) {
-          CHECK_EQ(field.GetDeclaringClass(), klass);
+          CHECK_EQ(field.GetDeclaringClass<kWithoutReadBarrier>(), klass);
         }
-        const PointerSize pointer_size = ic.pointer_size_;
-        for (ArtMethod& m : klass->GetMethods(pointer_size)) {
+        for (ArtMethod& m : klass->GetMethods(kPointerSize)) {
           ic.CheckArtMethod(&m, klass);
         }
-        ObjPtr<mirror::PointerArray> vtable = klass->GetVTable();
+        ObjPtr<mirror::PointerArray> vtable =
+            klass->GetVTable<kDefaultVerifyFlags, kWithoutReadBarrier>();
         if (vtable != nullptr) {
-          ic.CheckArtMethodPointerArray(vtable, nullptr);
+          ic.CheckArtMethodPointerArray(vtable);
         }
         if (klass->ShouldHaveImt()) {
-          ImTable* imt = klass->GetImt(pointer_size);
+          ImTable* imt = klass->GetImt(kPointerSize);
           for (size_t i = 0; i < ImTable::kSize; ++i) {
-            ic.CheckArtMethod(imt->Get(i, pointer_size), nullptr);
+            ic.CheckArtMethod(imt->Get(i, kPointerSize), /*expected_class=*/ nullptr);
           }
         }
         if (klass->ShouldHaveEmbeddedVTable()) {
           for (int32_t i = 0; i < klass->GetEmbeddedVTableLength(); ++i) {
-            ic.CheckArtMethod(klass->GetEmbeddedVTableEntry(i, pointer_size), nullptr);
+            ic.CheckArtMethod(klass->GetEmbeddedVTableEntry(i, kPointerSize),
+                              /*expected_class=*/ nullptr);
           }
         }
-        ObjPtr<mirror::IfTable> iftable = klass->GetIfTable();
-        for (int32_t i = 0; i < klass->GetIfTableCount(); ++i) {
-          if (iftable->GetMethodArrayCount(i) > 0) {
-            ic.CheckArtMethodPointerArray(iftable->GetMethodArray(i), nullptr);
+        ObjPtr<mirror::IfTable> iftable =
+            klass->GetIfTable<kDefaultVerifyFlags, kWithoutReadBarrier>();
+        int32_t iftable_count = (iftable != nullptr) ? iftable->Count() : 0;
+        for (int32_t i = 0; i < iftable_count; ++i) {
+          ObjPtr<mirror::PointerArray> method_array =
+              iftable->GetMethodArrayOrNull<kDefaultVerifyFlags, kWithoutReadBarrier>(i);
+          if (method_array != nullptr) {
+            ic.CheckArtMethodPointerArray(method_array);
           }
         }
       }
     };
-    heap->VisitObjects(visitor);
+    space->GetLiveBitmap()->VisitMarkedRange(objects_begin, objects_end, visitor);
   }
 
  private:
-  ImageChecker(gc::Heap* heap, ClassLinker* class_linker)
-     :  spaces_(heap->GetBootImageSpaces()),
-        pointer_size_(class_linker->GetImagePointerSize()) {
-    space_begin_.reserve(spaces_.size());
-    method_sections_.reserve(spaces_.size());
-    runtime_method_sections_.reserve(spaces_.size());
-    for (gc::space::ImageSpace* space : spaces_) {
+  explicit ImageChecker(gc::Heap* heap) {
+    ArrayRef<gc::space::ImageSpace* const> spaces(heap->GetBootImageSpaces());
+    space_begin_.reserve(spaces.size());
+    for (gc::space::ImageSpace* space : spaces) {
+      CHECK_EQ(static_cast<const void*>(space->Begin()), &space->GetImageHeader());
       space_begin_.push_back(space->Begin());
-      auto& header = space->GetImageHeader();
-      method_sections_.push_back(&header.GetMethodsSection());
-      runtime_method_sections_.push_back(&header.GetRuntimeMethodsSection());
     }
   }
 
   void CheckArtMethod(ArtMethod* m, ObjPtr<mirror::Class> expected_class)
       REQUIRES_SHARED(Locks::mutator_lock_) {
+    ObjPtr<mirror::Class> declaring_class = m->GetDeclaringClassUnchecked<kWithoutReadBarrier>();
     if (m->IsRuntimeMethod()) {
-      ObjPtr<mirror::Class> declaring_class = m->GetDeclaringClassUnchecked();
       CHECK(declaring_class == nullptr) << declaring_class << " " << m->PrettyMethod();
     } else if (m->IsCopied()) {
-      CHECK(m->GetDeclaringClass() != nullptr) << m->PrettyMethod();
+      CHECK(declaring_class != nullptr) << m->PrettyMethod();
     } else if (expected_class != nullptr) {
-      CHECK_EQ(m->GetDeclaringClassUnchecked(), expected_class) << m->PrettyMethod();
+      CHECK_EQ(declaring_class, expected_class) << m->PrettyMethod();
     }
-    if (!spaces_.empty()) {
-      bool contains = false;
-      for (size_t i = 0; !contains && i != space_begin_.size(); ++i) {
-        const size_t offset = reinterpret_cast<uint8_t*>(m) - space_begin_[i];
-        contains = method_sections_[i]->Contains(offset) ||
-            runtime_method_sections_[i]->Contains(offset);
+    bool contains = false;
+    for (const uint8_t* begin : space_begin_) {
+      const size_t offset = reinterpret_cast<uint8_t*>(m) - begin;
+      const ImageHeader* header = reinterpret_cast<const ImageHeader*>(begin);
+      if (header->GetMethodsSection().Contains(offset) ||
+          header->GetRuntimeMethodsSection().Contains(offset)) {
+        contains = true;
+        break;
       }
-      CHECK(contains) << m << " not found";
     }
+    CHECK(contains) << m << " not found";
   }
 
-  void CheckArtMethodPointerArray(ObjPtr<mirror::PointerArray> arr,
-                                  ObjPtr<mirror::Class> expected_class)
+  void CheckArtMethodPointerArray(ObjPtr<mirror::PointerArray> arr)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     CHECK(arr != nullptr);
     for (int32_t j = 0; j < arr->GetLength(); ++j) {
-      auto* method = arr->GetElementPtrSize<ArtMethod*>(j, pointer_size_);
-      // expected_class == null means we are a dex cache.
-      if (expected_class != nullptr) {
-        CHECK(method != nullptr);
-      }
-      if (method != nullptr) {
-        CheckArtMethod(method, expected_class);
-      }
+      auto* method = arr->GetElementPtrSize<ArtMethod*>(j, kPointerSize);
+      CHECK(method != nullptr);
+      CheckArtMethod(method, /*expected_class=*/ nullptr);
     }
   }
 
-  const std::vector<gc::space::ImageSpace*>& spaces_;
-  const PointerSize pointer_size_;
-
-  // Cached sections from the spaces.
   std::vector<const uint8_t*> space_begin_;
-  std::vector<const ImageSection*> method_sections_;
-  std::vector<const ImageSection*> runtime_method_sections_;
 };
 
 static void VerifyAppImage(const ImageHeader& header,
@@ -1964,7 +1965,11 @@ bool ClassLinker::AddImageSpace(
 
   if (kCheckImageObjects) {
     if (!app_image) {
-      ImageChecker::CheckObjects(heap, this);
+      if (image_pointer_size_ == PointerSize::k64) {
+        ImageChecker<PointerSize::k64>::CheckObjects(heap, space);
+      } else {
+        ImageChecker<PointerSize::k32>::CheckObjects(heap, space);
+      }
     }
   }
 
@@ -3820,34 +3825,30 @@ void ClassLinker::RegisterDexFileLocked(const DexFile& dex_file,
     // dex file location is /system/priv-app/SettingsProvider/SettingsProvider.apk
     CHECK_EQ(dex_cache_location, dex_file_suffix);
   }
+
+  // Check if we need to initialize OatFile data (.data.bimg.rel.ro and .bss
+  // sections) needed for code execution.
   const OatFile* oat_file =
       (dex_file.GetOatDexFile() != nullptr) ? dex_file.GetOatDexFile()->GetOatFile() : nullptr;
-  // Clean up pass to remove null dex caches; null dex caches can occur due to class unloading
-  // and we are lazily removing null entries. Also check if we need to initialize OatFile data
-  // (.data.bimg.rel.ro and .bss sections) needed for code execution.
   bool initialize_oat_file_data = (oat_file != nullptr) && oat_file->IsExecutable();
-  JavaVMExt* const vm = self->GetJniEnv()->GetVm();
-  for (auto it = dex_caches_.begin(); it != dex_caches_.end(); ) {
-    const DexCacheData& data = it->second;
-    if (self->IsJWeakCleared(data.weak_root)) {
-      vm->DeleteWeakGlobalRef(self, data.weak_root);
-      it = dex_caches_.erase(it);
-    } else {
-      if (initialize_oat_file_data &&
-          it->first->GetOatDexFile() != nullptr &&
-          it->first->GetOatDexFile()->GetOatFile() == oat_file) {
+  if (initialize_oat_file_data) {
+    for (const auto& entry : dex_caches_) {
+      if (!self->IsJWeakCleared(entry.second.weak_root) &&
+          entry.first->GetOatDexFile() != nullptr &&
+          entry.first->GetOatDexFile()->GetOatFile() == oat_file) {
         initialize_oat_file_data = false;  // Already initialized.
+        break;
       }
-      ++it;
     }
   }
   if (initialize_oat_file_data) {
     oat_file->InitializeRelocations();
   }
+
   // Let hiddenapi assign a domain to the newly registered dex file.
   hiddenapi::InitializeDexFileDomain(dex_file, class_loader);
 
-  jweak dex_cache_jweak = vm->AddWeakGlobalRef(self, dex_cache);
+  jweak dex_cache_jweak = self->GetJniEnv()->GetVm()->AddWeakGlobalRef(self, dex_cache);
   DexCacheData data;
   data.weak_root = dex_cache_jweak;
   data.class_table = ClassTableForClassLoader(class_loader);
@@ -7859,20 +7860,6 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::FinalizeIfTable(
   return true;
 }
 
-NO_INLINE
-static void ThrowIllegalAccessErrorForImplementingMethod(ObjPtr<mirror::Class> klass,
-                                                         ArtMethod* vtable_method,
-                                                         ArtMethod* interface_method)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(!vtable_method->IsAbstract());
-  DCHECK(!vtable_method->IsPublic());
-  ThrowIllegalAccessError(
-      klass,
-      "Method '%s' implementing interface method '%s' is not public",
-      vtable_method->PrettyMethod().c_str(),
-      interface_method->PrettyMethod().c_str());
-}
-
 template <PointerSize kPointerSize>
 ObjPtr<mirror::PointerArray> ClassLinker::LinkMethodsHelper<kPointerSize>::AllocPointerArray(
     Thread* self, size_t length) {
@@ -8126,15 +8113,11 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
           found = true;
         }
       }
+      found = found && vtable_method->IsPublic();
+
       uint32_t vtable_index = vtable_length;
       if (found) {
         DCHECK(vtable_method != nullptr);
-        if (!vtable_method->IsAbstract() && !vtable_method->IsPublic()) {
-          // FIXME: Delay the exception until we actually try to call the method. b/211854716
-          sants.reset();
-          ThrowIllegalAccessErrorForImplementingMethod(klass, vtable_method, interface_method);
-          return 0u;
-        }
         vtable_index = vtable_method->GetMethodIndexDuringLinking();
         if (!vtable_method->IsOverridableByDefaultMethod()) {
           method_array->SetElementPtrSize(j, vtable_index, kPointerSize);
@@ -10236,6 +10219,23 @@ void ClassLinker::CleanupClassLoaders() {
         VLOG(class_linker) << "Freeing class loader";
         to_delete.push_back(data);
         it = class_loaders_.erase(it);
+      }
+    }
+  }
+  if (!to_delete.empty()) {
+    JavaVMExt* vm = self->GetJniEnv()->GetVm();
+    WriterMutexLock mu(self, *Locks::dex_lock_);
+    for (auto it = dex_caches_.begin(), end = dex_caches_.end(); it != end; ) {
+      const DexCacheData& data = it->second;
+      if (self->DecodeJObject(data.weak_root) == nullptr) {
+        DCHECK(to_delete.end() != std::find_if(
+            to_delete.begin(),
+            to_delete.end(),
+            [&](const ClassLoaderData& cld) { return cld.class_table == data.class_table; }));
+        vm->DeleteWeakGlobalRef(self, data.weak_root);
+        it = dex_caches_.erase(it);
+      } else {
+        ++it;
       }
     }
   }

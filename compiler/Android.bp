@@ -30,6 +30,7 @@ package {
 
 art_cc_defaults {
     name: "libart-compiler-defaults",
+    cflags: ["-O3"],
     defaults: ["art_defaults"],
     host_supported: true,
     srcs: [
@@ -176,6 +177,8 @@ art_cc_defaults {
     ],
 
     export_include_dirs: ["."],
+    // Not using .map.txt because this is an internal API
+    version_script: "libart-compiler.map",
 }
 
 cc_defaults {
@@ -202,6 +205,7 @@ gensrcs {
 
 art_cc_library {
     name: "libart-compiler",
+    cflags: ["-O3"],
     defaults: [
         "libart-compiler-defaults",
         "dex2oat-pgo-defaults",
@@ -228,7 +232,7 @@ art_cc_library {
         "libprofile",
         "libdexfile",
     ],
-    whole_static_libs: ["libelffile"],
+    static_libs: ["libelffile"],
     runtime_libs: [
         // `art::HGraphVisualizerDisassembler::HGraphVisualizerDisassembler` may dynamically load
         // `libart-disassembler.so`.
@@ -263,6 +267,7 @@ cc_defaults {
 
 art_cc_library {
     name: "libartd-compiler",
+    cflags: ["-O3"],
     defaults: [
         "art_debug_defaults",
         "libart-compiler-defaults",
@@ -296,7 +301,7 @@ art_cc_library {
         "libprofiled",
         "libdexfiled",
     ],
-    whole_static_libs: ["libelffiled"],
+    static_libs: ["libelffiled"],
     runtime_libs: [
         // `art::HGraphVisualizerDisassembler::HGraphVisualizerDisassembler` may dynamically load
         // `libartd-disassembler.so`.
@@ -338,6 +343,7 @@ art_cc_defaults {
 
 art_cc_library {
     name: "libart-compiler-gtest",
+    cflags: ["-O3"],
     defaults: [
         "libart-gtest-defaults",
         "libart-compiler-gtest-common",
@@ -482,16 +488,19 @@ art_cc_defaults {
 // TODO(b/192274705): Remove this module when the migration to standalone ART gtests is complete.
 art_cc_test {
     name: "art_compiler_tests",
+    cflags: ["-O3"],
     defaults: [
         "art_gtest_defaults",
         "art_compiler_tests_defaults",
     ],
     shared_libs: [
         "libprofiled",
-        "libartd-compiler",
         "libartd-simulator-container",
+        "liblzma",
     ],
     static_libs: [
+        "libartd-compiler",
+        "libelffiled",
         "libvixld",
     ],
 }
@@ -506,7 +515,8 @@ art_cc_test {
     data: [":generate-boot-image"],
     shared_libs: [
         "libprofile",
-        "libart-compiler",
+        "liblzma",
+        "libartpalette",
     ],
     static_libs: [
         // For now, link `libart-simulator-container` statically for simplicity,
@@ -515,6 +525,8 @@ art_cc_test {
         // TODO(b/192070541): Consider linking `libart-simulator-container`
         // dynamically.
         "libart-simulator-container",
+        "libart-compiler",
+        "libelffile",
         "libvixl",
     ],
     test_config: "art_standalone_compiler_tests.xml",
@@ -522,6 +534,7 @@ art_cc_test {
 
 art_cc_test {
     name: "art_compiler_host_tests",
+    cflags: ["-O3"],
     device_supported: false,
     defaults: [
         "art_gtest_defaults",
@@ -548,9 +561,11 @@ art_cc_test {
         },
     },
     shared_libs: [
-        "libartd-compiler",
+        "liblzma",
     ],
     static_libs: [
+        "libartd-compiler",
+        "libelffiled",
         "libvixld",
     ],
 }
