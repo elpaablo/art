@@ -84,7 +84,7 @@ static const vixl::aarch32::RegisterList kCoreCalleeSaves = vixl::aarch32::Regis
                                 vixl::aarch32::r6,
                                 vixl::aarch32::r7),
     // Do not consider r8 as a callee-save register with Baker read barriers.
-    ((kEmitCompilerReadBarrier && kUseBakerReadBarrier)
+    ((gUseReadBarrier && kUseBakerReadBarrier)
          ? vixl::aarch32::RegisterList()
          : vixl::aarch32::RegisterList(vixl::aarch32::r8)),
     vixl::aarch32::RegisterList(vixl::aarch32::r10,
@@ -477,11 +477,16 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
     return vixl::aarch32::kSRegSizeInBytes;
   }
 
-  size_t GetSIMDRegisterWidth() const override {
+  size_t GetTraditionalSIMDRegisterWidth() const override {
     // ARM 32-bit backend doesn't support Q registers in vectorizer, only D
     // registers (due to register allocator restrictions: overlapping s/d/q
     // registers).
     return vixl::aarch32::kDRegSizeInBytes;
+  }
+
+  size_t GetActualSIMDRegisterWidthFromGraph() const override {
+    DCHECK(!GetGraph()->HasPredicatedSIMD());
+    return GetTraditionalSIMDRegisterWidth();
   }
 
   HGraphVisitor* GetLocationBuilder() override { return &location_builder_; }

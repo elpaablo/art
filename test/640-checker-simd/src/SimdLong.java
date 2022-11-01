@@ -69,6 +69,8 @@ public class SimdLong {
   ///     CHECK-NOT: VecMul
   //
   /// CHECK-FI:
+  //
+  // Note: Arm64 SVE has MUL for long type, NEON doesn't.
   static void mul(long x) {
     for (int i = 0; i < 128; i++)
       a[i] *= x;
@@ -173,7 +175,7 @@ public class SimdLong {
   /// CHECK-DAG:              ArraySet [{{l\d+}},{{i\d+}},<<Get>>] loop:<<Loop>>      outer_loop:none
   //
   /// CHECK-START-ARM64: void SimdLong.shr64() loop_optimization (after)
-  /// CHECK-IF:     hasIsaFeature("sve")
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
   ///     CHECK-DAG: <<Get:d\d+>> VecLoad                                       loop:<<Loop:B\d+>> outer_loop:none
   ///     CHECK-DAG:              VecStore [{{l\d+}},{{i\d+}},<<Get>>,{{j\d+}}] loop:<<Loop>>      outer_loop:none
@@ -204,7 +206,7 @@ public class SimdLong {
   //
   /// CHECK-START-ARM64: void SimdLong.shr65() loop_optimization (after)
   /// CHECK-DAG: <<Dist:i\d+>> IntConstant 1                         loop:none
-  /// CHECK-IF:     hasIsaFeature("sve")
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
   ///     CHECK-DAG: <<Get:d\d+>>  VecLoad                                        loop:<<Loop:B\d+>> outer_loop:none
   ///     CHECK-DAG: <<UShr:d\d+>> VecUShr [<<Get>>,<<Dist>>,{{j\d+}}]            loop:<<Loop>>      outer_loop:none
@@ -236,7 +238,7 @@ public class SimdLong {
   //
   /// CHECK-START-ARM64: void SimdLong.shrMinus254() loop_optimization (after)
   /// CHECK-DAG: <<Dist:i\d+>> IntConstant 2                         loop:none
-  /// CHECK-IF:     hasIsaFeature("sve")
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
   ///     CHECK-DAG: <<Get:d\d+>>  VecLoad                                        loop:<<Loop:B\d+>> outer_loop:none
   ///     CHECK-DAG: <<UShr:d\d+>> VecUShr [<<Get>>,<<Dist>>,{{j\d+}}]            loop:<<Loop>>      outer_loop:none

@@ -38,6 +38,7 @@
 #include "handle.h"
 #include "handle_scope.h"
 #include "interpreter/interpreter_cache.h"
+#include "interpreter/shadow_frame.h"
 #include "javaheapprof/javaheapsampler.h"
 #include "jvalue.h"
 #include "managed_stack.h"
@@ -229,8 +230,11 @@ class Thread {
 
   // Attaches the calling native thread to the runtime, returning the new native peer.
   // Used to implement JNI AttachCurrentThread and AttachCurrentThreadAsDaemon calls.
-  static Thread* Attach(const char* thread_name, bool as_daemon, jobject thread_group,
-                        bool create_peer);
+  static Thread* Attach(const char* thread_name,
+                        bool as_daemon,
+                        jobject thread_group,
+                        bool create_peer,
+                        bool should_run_callbacks);
   // Attaches the calling native thread to the runtime, returning the new native peer.
   static Thread* Attach(const char* thread_name, bool as_daemon, jobject thread_peer);
 
@@ -373,11 +377,11 @@ class Thread {
   void WaitForFlipFunction(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
   gc::accounting::AtomicStack<mirror::Object>* GetThreadLocalMarkStack() {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tlsPtr_.thread_local_mark_stack;
   }
   void SetThreadLocalMarkStack(gc::accounting::AtomicStack<mirror::Object>* stack) {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     tlsPtr_.thread_local_mark_stack = stack;
   }
 
@@ -715,6 +719,9 @@ class Thread {
     return tlsPtr_.frame_id_to_shadow_frame != nullptr;
   }
 
+  // This is done by GC using a checkpoint (or in a stop-the-world pause).
+  void SweepInterpreterCache(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
+
   void VisitRoots(RootVisitor* visitor, VisitRootFlags flags)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -764,6 +771,13 @@ class Thread {
     return ThreadOffset<pointer_size>(
         OFFSETOF_MEMBER(Thread, tls32_) +
         OFFSETOF_MEMBER(tls_32bit_sized_values, is_gc_marking));
+  }
+
+  template <PointerSize pointer_size>
+  static constexpr ThreadOffset<pointer_size> DeoptCheckRequiredOffset() {
+    return ThreadOffset<pointer_size>(
+        OFFSETOF_MEMBER(Thread, tls32_) +
+        OFFSETOF_MEMBER(tls_32bit_sized_values, is_deopt_check_required));
   }
 
   static constexpr size_t IsGcMarkingSize() {
@@ -1011,33 +1025,34 @@ class Thread {
   }
 
   bool GetIsGcMarking() const {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tls32_.is_gc_marking;
   }
 
   void SetIsGcMarkingAndUpdateEntrypoints(bool is_marking);
 
+  bool IsDeoptCheckRequired() const { return tls32_.is_deopt_check_required; }
+
+  void SetDeoptCheckRequired(bool flag) { tls32_.is_deopt_check_required = flag; }
+
   bool GetWeakRefAccessEnabled() const;  // Only safe for current thread.
 
   void SetWeakRefAccessEnabled(bool enabled) {
-    CHECK(kUseReadBarrier);
+    DCHECK(gUseReadBarrier);
     WeakRefAccessState new_state = enabled ?
         WeakRefAccessState::kEnabled : WeakRefAccessState::kDisabled;
     tls32_.weak_ref_access_enabled.store(new_state, std::memory_order_release);
   }
 
   uint32_t GetDisableThreadFlipCount() const {
-    CHECK(kUseReadBarrier);
     return tls32_.disable_thread_flip_count;
   }
 
   void IncrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     ++tls32_.disable_thread_flip_count;
   }
 
   void DecrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     DCHECK_GT(tls32_.disable_thread_flip_count, 0U);
     --tls32_.disable_thread_flip_count;
   }
@@ -1091,7 +1106,8 @@ class Thread {
   void AssertHasDeoptimizationContext()
       REQUIRES_SHARED(Locks::mutator_lock_);
   void PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type);
-  ShadowFrame* PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present = true);
+  ShadowFrame* PopStackedShadowFrame();
+  ShadowFrame* MaybePopDeoptimizedStackedShadowFrame();
 
   // For debugger, find the shadow frame that corresponds to a frame id.
   // Or return null if there is none.
@@ -1205,6 +1221,10 @@ class Thread {
     tlsPtr_.thread_local_end += bytes;
     DCHECK_LE(tlsPtr_.thread_local_end, tlsPtr_.thread_local_limit);
   }
+
+  // Called from Concurrent mark-compact GC to slide the TLAB pointers backwards
+  // to adjust to post-compact addresses.
+  void AdjustTlab(size_t slide_bytes);
 
   // Doesn't check that there is room.
   mirror::Object* AllocTlab(size_t bytes);
@@ -1413,7 +1433,7 @@ class Thread {
  private:
   explicit Thread(bool daemon);
   ~Thread() REQUIRES(!Locks::mutator_lock_, !Locks::thread_suspend_count_lock_);
-  void Destroy();
+  void Destroy(bool should_run_callbacks);
 
   // Deletes and clears the tlsPtr_.jpeer field. Done in a way so that both it and opeer cannot be
   // observed to be set at the same time by instrumentation.
@@ -1424,7 +1444,8 @@ class Thread {
   template <typename PeerAction>
   static Thread* Attach(const char* thread_name,
                         bool as_daemon,
-                        PeerAction p);
+                        PeerAction p,
+                        bool should_run_callbacks);
 
   void CreatePeer(const char* name, bool as_daemon, jobject thread_group);
 
@@ -1562,9 +1583,6 @@ class Thread {
 
   template <bool kPrecise>
   void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  static void SweepInterpreterCaches(IsMarkedVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static bool IsAotCompiler();
 
@@ -1712,6 +1730,7 @@ class Thread {
           thread_exit_check_count(0),
           is_transitioning_to_runnable(false),
           is_gc_marking(false),
+          is_deopt_check_required(false),
           weak_ref_access_enabled(WeakRefAccessState::kVisiblyEnabled),
           disable_thread_flip_count(0),
           user_code_suspend_count(0),
@@ -1765,6 +1784,12 @@ class Thread {
     // thread local so that we can simplify the logic to check for the fast path of read barriers of
     // GC roots.
     bool32_t is_gc_marking;
+
+    // True if we need to check for deoptimization when returning from the runtime functions. This
+    // is required only when a class is redefined to prevent executing code that has field offsets
+    // embedded. For non-debuggable apps redefinition is not allowed and this flag should always be
+    // set to false.
+    bool32_t is_deopt_check_required;
 
     // Thread "interrupted" status; stays raised until queried or thrown.
     Atomic<bool32_t> interrupted;
@@ -2152,17 +2177,18 @@ class ScopedAllowThreadSuspension {
 
 class ScopedStackedShadowFramePusher {
  public:
-  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf, StackedShadowFrameType type)
-    : self_(self), type_(type) {
-    self_->PushStackedShadowFrame(sf, type);
+  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf) : self_(self), sf_(sf) {
+    DCHECK_EQ(sf->GetLink(), nullptr);
+    self_->PushStackedShadowFrame(sf, StackedShadowFrameType::kShadowFrameUnderConstruction);
   }
   ~ScopedStackedShadowFramePusher() {
-    self_->PopStackedShadowFrame(type_);
+    ShadowFrame* sf = self_->PopStackedShadowFrame();
+    DCHECK_EQ(sf, sf_);
   }
 
  private:
   Thread* const self_;
-  const StackedShadowFrameType type_;
+  ShadowFrame* const sf_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedStackedShadowFramePusher);
 };
@@ -2186,13 +2212,13 @@ class ScopedTransitioningToRunnable : public ValueObject {
   explicit ScopedTransitioningToRunnable(Thread* self)
       : self_(self) {
     DCHECK_EQ(self, Thread::Current());
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(true);
     }
   }
 
   ~ScopedTransitioningToRunnable() {
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(false);
     }
   }

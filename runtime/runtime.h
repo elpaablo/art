@@ -271,13 +271,16 @@ class Runtime {
   jobject GetSystemClassLoader() const;
 
   // Attaches the calling native thread to the runtime.
-  bool AttachCurrentThread(const char* thread_name, bool as_daemon, jobject thread_group,
-                           bool create_peer);
+  bool AttachCurrentThread(const char* thread_name,
+                           bool as_daemon,
+                           jobject thread_group,
+                           bool create_peer,
+                           bool should_run_callbacks = true);
 
   void CallExitHook(jint status);
 
   // Detaches the current native thread from the runtime.
-  void DetachCurrentThread() REQUIRES(!Locks::mutator_lock_);
+  void DetachCurrentThread(bool should_run_callbacks = true) REQUIRES(!Locks::mutator_lock_);
 
   void DumpDeoptimizations(std::ostream& os);
   void DumpForSigQuit(std::ostream& os);
@@ -430,8 +433,7 @@ class Runtime {
 
   // Sweep system weaks, the system weak is deleted if the visitor return null. Otherwise, the
   // system weak is updated to be the visitor's returned value.
-  void SweepSystemWeaks(IsMarkedVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  void SweepSystemWeaks(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Walk all reflective objects and visit their targets as well as any method/fields held by the
   // runtime threads that are marked as being reflective.
@@ -1072,6 +1074,10 @@ class Runtime {
   // Return whether a boot image has a profile. This means it's an in-memory
   // image rather that an image loaded from disk.
   bool HasImageWithProfile() const;
+
+  bool GetNoSigChain() const {
+    return no_sig_chain_;
+  }
 
   // Trigger a flag reload from system properties or device congfigs.
   //

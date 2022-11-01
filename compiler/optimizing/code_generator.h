@@ -33,6 +33,7 @@
 #include "graph_visualizer.h"
 #include "locations.h"
 #include "nodes.h"
+#include "oat_quick_method_header.h"
 #include "optimizing_compiler_stats.h"
 #include "read_barrier_option.h"
 #include "stack.h"
@@ -56,8 +57,8 @@ static int32_t constexpr kPrimIntMax = 0x7fffffff;
 // Maximum value for a primitive long.
 static int64_t constexpr kPrimLongMax = INT64_C(0x7fffffffffffffff);
 
-static constexpr ReadBarrierOption kCompilerReadBarrierOption =
-    kEmitCompilerReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
+static const ReadBarrierOption gCompilerReadBarrierOption =
+    gUseReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
 
 class Assembler;
 class CodeGenerator;
@@ -241,7 +242,10 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
   virtual size_t GetCalleePreservedFPWidth() const  = 0;
 
   // Get the size of the target SIMD register in bytes.
-  virtual size_t GetSIMDRegisterWidth() const = 0;
+  virtual size_t GetTraditionalSIMDRegisterWidth() const = 0;
+  virtual size_t GetPredicatedSIMDRegisterWidth() const  { return 0; }
+  virtual size_t GetActualSIMDRegisterWidthFromGraph() const = 0;
+
   virtual uintptr_t GetAddressOf(HBasicBlock* block) = 0;
   void InitializeCodeGeneration(size_t number_of_spill_slots,
                                 size_t maximum_safepoint_spill_size,
@@ -460,7 +464,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
     // If the target class is in the boot image, it's non-moveable and it doesn't matter
     // if we compare it with a from-space or to-space reference, the result is the same.
     // It's OK to traverse a class hierarchy jumping between from-space and to-space.
-    return kEmitCompilerReadBarrier && !instance_of->GetTargetClass()->IsInBootImage();
+    return gUseReadBarrier && !instance_of->GetTargetClass()->IsInBootImage();
   }
 
   static ReadBarrierOption ReadBarrierOptionForInstanceOf(HInstanceOf* instance_of) {
@@ -475,7 +479,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
       case TypeCheckKind::kArrayObjectCheck:
       case TypeCheckKind::kInterfaceCheck: {
         bool needs_read_barrier =
-            kEmitCompilerReadBarrier && !check_cast->GetTargetClass()->IsInBootImage();
+            gUseReadBarrier && !check_cast->GetTargetClass()->IsInBootImage();
         // We do not emit read barriers for HCheckCast, so we can get false negatives
         // and the slow path shall re-check and simply return if the cast is actually OK.
         return !needs_read_barrier;
@@ -678,7 +682,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
         return LocationSummary::kCallOnMainOnly;
       case HLoadString::LoadKind::kJitTableAddress:
         DCHECK(!load->NeedsEnvironment());
-        return kEmitCompilerReadBarrier
+        return gUseReadBarrier
             ? LocationSummary::kCallOnSlowPath
             : LocationSummary::kNoCall;
         break;

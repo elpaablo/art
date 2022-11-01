@@ -16,15 +16,13 @@
 
 #include "runtime.h"
 
-// sys/mount.h has to come before linux/fs.h due to redefinition of MS_RDONLY, MS_BIND, etc
-#include <sys/mount.h>
 #ifdef __linux__
-#include <linux/fs.h>
 #include <sys/prctl.h>
 #endif
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/mount.h>
 #include <sys/syscall.h>
 
 #if defined(__APPLE__)
@@ -200,10 +198,6 @@ static constexpr double kLowMemoryMaxLoadFactor = 0.8;
 static constexpr double kNormalMinLoadFactor = 0.4;
 static constexpr double kNormalMaxLoadFactor = 0.7;
 
-// Extra added to the default heap growth multiplier. Used to adjust the GC ergonomics for the read
-// barrier config.
-static constexpr double kExtraDefaultHeapGrowthMultiplier = kUseReadBarrier ? 1.0 : 0.0;
-
 Runtime* Runtime::instance_ = nullptr;
 
 struct TraceConfig {
@@ -339,10 +333,16 @@ Runtime::~Runtime() {
     // In this case we will just try again without allocating a peer so that shutdown can continue.
     // Very few things are actually capable of distinguishing between the peer & peerless states so
     // this should be fine.
+    // Running callbacks is prone to deadlocks in libjdwp tests that need an event handler lock to
+    // process any event. We also need to enter a GCCriticalSection when processing certain events
+    // (for ex: removing the last breakpoint). These two restrictions together make the tear down
+    // of the jdwp tests deadlock prone if we fail to finish Thread::Attach callback.
+    // (TODO:b/251163712) Remove this once we update deopt manager to not use GCCriticalSection.
     bool thread_attached = AttachCurrentThread("Shutdown thread",
                                                /* as_daemon= */ false,
                                                GetSystemThreadGroup(),
-                                               /* create_peer= */ IsStarted());
+                                               /* create_peer= */ IsStarted(),
+                                               /* should_run_callbacks= */ false);
     if (UNLIKELY(!thread_attached)) {
       LOG(WARNING) << "Failed to attach shutdown thread. Trying again without a peer.";
       CHECK(AttachCurrentThread("Shutdown thread (no java peer)",
@@ -406,6 +406,12 @@ Runtime::~Runtime() {
   if (oat_file_manager_ != nullptr) {
     oat_file_manager_->WaitForWorkersToBeCreated();
   }
+  // Disable GC before deleting the thread-pool and shutting down runtime as it
+  // restricts attaching new threads.
+  heap_->DisableGCForShutdown();
+  heap_->WaitForWorkersToBeCreated();
+  // Make sure to let the GC complete if it is running.
+  heap_->WaitForGcToComplete(gc::kGcCauseBackground, self);
 
   {
     ScopedTrace trace2("Wait for shutdown cond");
@@ -436,12 +442,10 @@ Runtime::~Runtime() {
   }
 
   if (attach_shutdown_thread) {
-    DetachCurrentThread();
+    DetachCurrentThread(/* should_run_callbacks= */ false);
     self = nullptr;
   }
 
-  // Make sure to let the GC complete if it is running.
-  heap_->WaitForGcToComplete(gc::kGcCauseBackground, self);
   heap_->DeleteThreadPool();
   if (oat_file_manager_ != nullptr) {
     oat_file_manager_->DeleteThreadPool();
@@ -787,7 +791,6 @@ void Runtime::SweepSystemWeaks(IsMarkedVisitor* visitor) {
     // from mutators. See b/32167580.
     GetJit()->GetCodeCache()->SweepRootTables(visitor);
   }
-  Thread::SweepInterpreterCaches(visitor);
 
   // All other generic system-weak holders.
   for (gc::AbstractSystemWeakHolder* holder : system_weak_holders_) {
@@ -1144,7 +1147,6 @@ void Runtime::InitNonZygoteOrPostFork(
   }
 
   // Create the thread pools.
-  heap_->CreateThreadPool();
   // Avoid creating the runtime thread pool for system server since it will not be used and would
   // waste memory.
   if (!is_system_server) {
@@ -1587,9 +1589,11 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     // If low memory mode, use 1.0 as the multiplier by default.
     foreground_heap_growth_multiplier = 1.0f;
   } else {
+    // Extra added to the default heap growth multiplier for concurrent GC
+    // compaction algorithms. This is done for historical reasons.
+    // TODO: remove when we revisit heap configurations.
     foreground_heap_growth_multiplier =
-        runtime_options.GetOrDefault(Opt::ForegroundHeapGrowthMultiplier) +
-            kExtraDefaultHeapGrowthMultiplier;
+        runtime_options.GetOrDefault(Opt::ForegroundHeapGrowthMultiplier) + 1.0f;
   }
   XGcOption xgc_option = runtime_options.GetOrDefault(Opt::GcOption);
 
@@ -1617,9 +1621,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                        image_locations_,
                        instruction_set_,
                        // Override the collector type to CC if the read barrier config.
-                       kUseReadBarrier ? gc::kCollectorTypeCC : xgc_option.collector_type_,
-                       kUseReadBarrier ? BackgroundGcOption(gc::kCollectorTypeCCBackground)
-                                       : runtime_options.GetOrDefault(Opt::BackgroundGc),
+                       gUseReadBarrier ? gc::kCollectorTypeCC : xgc_option.collector_type_,
+                       gUseReadBarrier ? BackgroundGcOption(gc::kCollectorTypeCCBackground)
+                                       : BackgroundGcOption(xgc_option.collector_type_),
                        runtime_options.GetOrDefault(Opt::LargeObjectSpace),
                        runtime_options.GetOrDefault(Opt::LargeObjectThreshold),
                        runtime_options.GetOrDefault(Opt::ParallelGCThreads),
@@ -1777,7 +1781,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // ClassLinker needs an attached thread, but we can't fully attach a thread without creating
   // objects. We can't supply a thread group yet; it will be fixed later. Since we are the main
   // thread, we do not get a java peer.
-  Thread* self = Thread::Attach("main", false, nullptr, false);
+  Thread* self = Thread::Attach("main", false, nullptr, false, /* should_run_callbacks= */ true);
   CHECK_EQ(self->GetThreadId(), ThreadList::kMainThreadId);
   CHECK(self != nullptr);
 
@@ -2188,17 +2192,15 @@ void Runtime::ReclaimArenaPoolMemory() {
 }
 
 void Runtime::InitThreadGroups(Thread* self) {
-  JNIEnvExt* env = self->GetJniEnv();
-  ScopedJniEnvLocalRefState env_state(env);
+  ScopedObjectAccess soa(self);
+  ArtField* main_thread_group_field = WellKnownClasses::java_lang_ThreadGroup_mainThreadGroup;
+  ArtField* system_thread_group_field = WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup;
+  ObjPtr<mirror::Class> thread_group_class = main_thread_group_field->GetDeclaringClass();
   main_thread_group_ =
-      env->NewGlobalRef(env->GetStaticObjectField(
-          WellKnownClasses::java_lang_ThreadGroup,
-          WellKnownClasses::java_lang_ThreadGroup_mainThreadGroup));
+      soa.Vm()->AddGlobalRef(self, main_thread_group_field->GetObject(thread_group_class));
   CHECK_IMPLIES(main_thread_group_ == nullptr, IsAotCompiler());
   system_thread_group_ =
-      env->NewGlobalRef(env->GetStaticObjectField(
-          WellKnownClasses::java_lang_ThreadGroup,
-          WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup));
+      soa.Vm()->AddGlobalRef(self, system_thread_group_field->GetObject(thread_group_class));
   CHECK_IMPLIES(system_thread_group_ == nullptr, IsAotCompiler());
 }
 
@@ -2375,9 +2377,13 @@ void Runtime::BlockSignals() {
 }
 
 bool Runtime::AttachCurrentThread(const char* thread_name, bool as_daemon, jobject thread_group,
-                                  bool create_peer) {
+                                  bool create_peer, bool should_run_callbacks) {
   ScopedTrace trace(__FUNCTION__);
-  Thread* self = Thread::Attach(thread_name, as_daemon, thread_group, create_peer);
+  Thread* self = Thread::Attach(thread_name,
+                                as_daemon,
+                                thread_group,
+                                create_peer,
+                                should_run_callbacks);
   // Run ThreadGroup.add to notify the group that this thread is now started.
   if (self != nullptr && create_peer && !IsAotCompiler()) {
     ScopedObjectAccess soa(self);
@@ -2386,7 +2392,7 @@ bool Runtime::AttachCurrentThread(const char* thread_name, bool as_daemon, jobje
   return self != nullptr;
 }
 
-void Runtime::DetachCurrentThread() {
+void Runtime::DetachCurrentThread(bool should_run_callbacks) {
   ScopedTrace trace(__FUNCTION__);
   Thread* self = Thread::Current();
   if (self == nullptr) {
@@ -2395,7 +2401,7 @@ void Runtime::DetachCurrentThread() {
   if (self->HasManagedStack()) {
     LOG(FATAL) << *Thread::Current() << " attempting to detach while still running code";
   }
-  thread_list_->Unregister(self);
+  thread_list_->Unregister(self, should_run_callbacks);
 }
 
 mirror::Throwable* Runtime::GetPreAllocatedOutOfMemoryErrorWhenThrowingException() {
@@ -2457,6 +2463,9 @@ void Runtime::VisitConcurrentRoots(RootVisitor* visitor, VisitRootFlags flags) {
   class_linker_->VisitRoots(visitor, flags);
   jni_id_manager_->VisitRoots(visitor);
   heap_->VisitAllocationRecords(visitor);
+  if (jit_ != nullptr) {
+    jit_->GetCodeCache()->VisitRoots(visitor);
+  }
   if ((flags & kVisitRootFlagNewRoots) == 0) {
     // Guaranteed to have no new roots in the constant roots.
     VisitConstantRoots(visitor);
@@ -2585,7 +2594,7 @@ ArtMethod* Runtime::CreateCalleeSaveMethod() {
 }
 
 void Runtime::DisallowNewSystemWeaks() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   monitor_list_->DisallowNewMonitors();
   intern_table_->ChangeWeakRootState(gc::kWeakRootStateNoReadsOrWrites);
   java_vm_->DisallowNewWeakGlobals();
@@ -2601,7 +2610,7 @@ void Runtime::DisallowNewSystemWeaks() {
 }
 
 void Runtime::AllowNewSystemWeaks() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   monitor_list_->AllowNewMonitors();
   intern_table_->ChangeWeakRootState(gc::kWeakRootStateNormal);  // TODO: Do this in the sweeping.
   java_vm_->AllowNewWeakGlobals();

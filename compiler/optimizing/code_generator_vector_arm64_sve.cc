@@ -73,12 +73,12 @@ inline Location SVEEncodableConstantOrRegister(HInstruction* constant, HInstruct
   return Location::RequiresRegister();
 }
 
-void InstructionCodeGeneratorARM64Sve::ValidateVectorLength(HVecOperation* instr) const {
+void InstructionCodeGeneratorARM64::ValidateVectorLength(HVecOperation* instr) const {
   DCHECK_EQ(DataType::Size(instr->GetPackedType()) * instr->GetVectorLength(),
-            codegen_->GetSIMDRegisterWidth());
+            codegen_->GetPredicatedSIMDRegisterWidth());
 }
 
-void LocationsBuilderARM64Sve::VisitVecReplicateScalar(HVecReplicateScalar* instruction) {
+void LocationsBuilderARM64::SveVisitVecReplicateScalar(HVecReplicateScalar* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   HInstruction* input = instruction->InputAt(0);
   switch (instruction->GetPackedType()) {
@@ -109,7 +109,7 @@ void LocationsBuilderARM64Sve::VisitVecReplicateScalar(HVecReplicateScalar* inst
   }
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecReplicateScalar(HVecReplicateScalar* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecReplicateScalar(HVecReplicateScalar* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   Location src_loc = locations->InAt(0);
@@ -167,7 +167,7 @@ void InstructionCodeGeneratorARM64Sve::VisitVecReplicateScalar(HVecReplicateScal
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecExtractScalar(HVecExtractScalar* instruction) {
+void LocationsBuilderARM64::SveVisitVecExtractScalar(HVecExtractScalar* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
@@ -191,7 +191,7 @@ void LocationsBuilderARM64Sve::VisitVecExtractScalar(HVecExtractScalar* instruct
   }
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecExtractScalar(HVecExtractScalar* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecExtractScalar(HVecExtractScalar* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const VRegister src = VRegisterFrom(locations->InAt(0));
@@ -240,16 +240,16 @@ static void CreateVecUnOpLocations(ArenaAllocator* allocator, HVecUnaryOperation
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecReduce(HVecReduce* instruction) {
+void LocationsBuilderARM64::SveVisitVecReduce(HVecReduce* instruction) {
   CreateVecUnOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecReduce(HVecReduce* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecReduce(HVecReduce* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister src = ZRegisterFrom(locations->InAt(0));
   const VRegister dst = DRegisterFrom(locations->Out());
-  const PRegister p_reg = LoopPReg();
+  const PRegister p_reg = GetVecGoverningPReg(instruction);
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kInt32:
@@ -278,16 +278,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecReduce(HVecReduce* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecCnv(HVecCnv* instruction) {
+void LocationsBuilderARM64::SveVisitVecCnv(HVecCnv* instruction) {
   CreateVecUnOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecCnv(HVecCnv* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecCnv(HVecCnv* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister src = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   DataType::Type from = instruction->GetInputType();
   DataType::Type to = instruction->GetResultType();
   ValidateVectorLength(instruction);
@@ -298,16 +298,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecCnv(HVecCnv* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecNeg(HVecNeg* instruction) {
+void LocationsBuilderARM64::SveVisitVecNeg(HVecNeg* instruction) {
   CreateVecUnOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecNeg(HVecNeg* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecNeg(HVecNeg* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister src = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kUint8:
@@ -336,16 +336,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecNeg(HVecNeg* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecAbs(HVecAbs* instruction) {
+void LocationsBuilderARM64::SveVisitVecAbs(HVecAbs* instruction) {
   CreateVecUnOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecAbs(HVecAbs* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecAbs(HVecAbs* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister src = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kInt8:
@@ -372,16 +372,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecAbs(HVecAbs* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecNot(HVecNot* instruction) {
+void LocationsBuilderARM64::SveVisitVecNot(HVecNot* instruction) {
   CreateVecUnOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecNot(HVecNot* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecNot(HVecNot* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister src = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:  // special case boolean-not
@@ -431,17 +431,17 @@ static void CreateVecBinOpLocations(ArenaAllocator* allocator, HVecBinaryOperati
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecAdd(HVecAdd* instruction) {
+void LocationsBuilderARM64::SveVisitVecAdd(HVecAdd* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecAdd(HVecAdd* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecAdd(HVecAdd* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kUint8:
@@ -470,37 +470,37 @@ void InstructionCodeGeneratorARM64Sve::VisitVecAdd(HVecAdd* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecSaturationAdd(HVecSaturationAdd* instruction) {
+void LocationsBuilderARM64::SveVisitVecSaturationAdd(HVecSaturationAdd* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecSaturationAdd(HVecSaturationAdd* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecSaturationAdd(HVecSaturationAdd* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecHalvingAdd(HVecHalvingAdd* instruction) {
+void LocationsBuilderARM64::SveVisitVecHalvingAdd(HVecHalvingAdd* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecHalvingAdd(HVecHalvingAdd* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecHalvingAdd(HVecHalvingAdd* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecSub(HVecSub* instruction) {
+void LocationsBuilderARM64::SveVisitVecSub(HVecSub* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecSub(HVecSub* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecSub(HVecSub* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kUint8:
@@ -529,27 +529,27 @@ void InstructionCodeGeneratorARM64Sve::VisitVecSub(HVecSub* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecSaturationSub(HVecSaturationSub* instruction) {
+void LocationsBuilderARM64::SveVisitVecSaturationSub(HVecSaturationSub* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecSaturationSub(HVecSaturationSub* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecSaturationSub(HVecSaturationSub* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecMul(HVecMul* instruction) {
+void LocationsBuilderARM64::SveVisitVecMul(HVecMul* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecMul(HVecMul* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecMul(HVecMul* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kUint8:
@@ -578,17 +578,17 @@ void InstructionCodeGeneratorARM64Sve::VisitVecMul(HVecMul* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecDiv(HVecDiv* instruction) {
+void LocationsBuilderARM64::SveVisitVecDiv(HVecDiv* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecDiv(HVecDiv* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecDiv(HVecDiv* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
 
   // Note: VIXL guarantees StrictNaNPropagation for Fdiv.
@@ -605,38 +605,38 @@ void InstructionCodeGeneratorARM64Sve::VisitVecDiv(HVecDiv* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecMin(HVecMin* instruction) {
+void LocationsBuilderARM64::SveVisitVecMin(HVecMin* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecMin(HVecMin* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecMin(HVecMin* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecMax(HVecMax* instruction) {
+void LocationsBuilderARM64::SveVisitVecMax(HVecMax* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecMax(HVecMax* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecMax(HVecMax* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecAnd(HVecAnd* instruction) {
+void LocationsBuilderARM64::SveVisitVecAnd(HVecAnd* instruction) {
   // TODO: Allow constants supported by BIC (vector, immediate).
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecAnd(HVecAnd* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecAnd(HVecAnd* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
@@ -662,26 +662,26 @@ void InstructionCodeGeneratorARM64Sve::VisitVecAnd(HVecAnd* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecAndNot(HVecAndNot* instruction) {
+void LocationsBuilderARM64::SveVisitVecAndNot(HVecAndNot* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecAndNot(HVecAndNot* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecAndNot(HVecAndNot* instruction) {
   // TODO: Use BIC (vector, register).
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
 }
 
-void LocationsBuilderARM64Sve::VisitVecOr(HVecOr* instruction) {
+void LocationsBuilderARM64::SveVisitVecOr(HVecOr* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecOr(HVecOr* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecOr(HVecOr* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
@@ -707,17 +707,17 @@ void InstructionCodeGeneratorARM64Sve::VisitVecOr(HVecOr* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecXor(HVecXor* instruction) {
+void LocationsBuilderARM64::SveVisitVecXor(HVecXor* instruction) {
   CreateVecBinOpLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecXor(HVecXor* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecXor(HVecXor* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister rhs = ZRegisterFrom(locations->InAt(1));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
@@ -763,16 +763,16 @@ static void CreateVecShiftLocations(ArenaAllocator* allocator, HVecBinaryOperati
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecShl(HVecShl* instruction) {
+void LocationsBuilderARM64::SveVisitVecShl(HVecShl* instruction) {
   CreateVecShiftLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecShl(HVecShl* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecShl(HVecShl* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   int32_t value = locations->InAt(1).GetConstant()->AsIntConstant()->GetValue();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
@@ -796,16 +796,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecShl(HVecShl* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecShr(HVecShr* instruction) {
+void LocationsBuilderARM64::SveVisitVecShr(HVecShr* instruction) {
   CreateVecShiftLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecShr(HVecShr* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecShr(HVecShr* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   int32_t value = locations->InAt(1).GetConstant()->AsIntConstant()->GetValue();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
@@ -829,16 +829,16 @@ void InstructionCodeGeneratorARM64Sve::VisitVecShr(HVecShr* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecUShr(HVecUShr* instruction) {
+void LocationsBuilderARM64::SveVisitVecUShr(HVecUShr* instruction) {
   CreateVecShiftLocations(GetGraph()->GetAllocator(), instruction);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecUShr(HVecUShr* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecUShr(HVecUShr* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister lhs = ZRegisterFrom(locations->InAt(0));
   const ZRegister dst = ZRegisterFrom(locations->Out());
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   int32_t value = locations->InAt(1).GetConstant()->AsIntConstant()->GetValue();
   ValidateVectorLength(instruction);
   switch (instruction->GetPackedType()) {
@@ -862,7 +862,7 @@ void InstructionCodeGeneratorARM64Sve::VisitVecUShr(HVecUShr* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecSetScalars(HVecSetScalars* instruction) {
+void LocationsBuilderARM64::SveVisitVecSetScalars(HVecSetScalars* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
 
   DCHECK_EQ(2u, instruction->InputCount());  // only one input currently implemented + predicate.
@@ -894,7 +894,7 @@ void LocationsBuilderARM64Sve::VisitVecSetScalars(HVecSetScalars* instruction) {
   }
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecSetScalars(HVecSetScalars* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecSetScalars(HVecSetScalars* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister z_dst = ZRegisterFrom(locations->Out());
@@ -955,21 +955,21 @@ static void CreateVecAccumLocations(ArenaAllocator* allocator, HVecOperation* in
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecMultiplyAccumulate(HVecMultiplyAccumulate* instruction) {
+void LocationsBuilderARM64::SveVisitVecMultiplyAccumulate(HVecMultiplyAccumulate* instruction) {
   CreateVecAccumLocations(GetGraph()->GetAllocator(), instruction);
 }
 
 // Some early revisions of the Cortex-A53 have an erratum (835769) whereby it is possible for a
 // 64-bit scalar multiply-accumulate instruction in AArch64 state to generate an incorrect result.
 // However vector MultiplyAccumulate instruction is not affected.
-void InstructionCodeGeneratorARM64Sve::VisitVecMultiplyAccumulate(
+void InstructionCodeGeneratorARM64::SveVisitVecMultiplyAccumulate(
     HVecMultiplyAccumulate* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   const ZRegister acc = ZRegisterFrom(locations->InAt(0));
   const ZRegister left = ZRegisterFrom(locations->InAt(1));
   const ZRegister right = ZRegisterFrom(locations->InAt(2));
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
 
   DCHECK(locations->InAt(0).Equals(locations->Out()));
   ValidateVectorLength(instruction);
@@ -1004,17 +1004,17 @@ void InstructionCodeGeneratorARM64Sve::VisitVecMultiplyAccumulate(
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecSADAccumulate(HVecSADAccumulate* instruction) {
+void LocationsBuilderARM64::SveVisitVecSADAccumulate(HVecSADAccumulate* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecSADAccumulate(HVecSADAccumulate* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecSADAccumulate(HVecSADAccumulate* instruction) {
   LOG(FATAL) << "Unsupported SIMD instruction " << instruction->GetId();
-  UNREACHABLE();
+  CHECK(false);
 }
 
-void LocationsBuilderARM64Sve::VisitVecDotProd(HVecDotProd* instruction) {
+void LocationsBuilderARM64::SveVisitVecDotProd(HVecDotProd* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   DCHECK(instruction->GetPackedType() == DataType::Type::kInt32);
   locations->SetInAt(0, Location::RequiresFpuRegister());
@@ -1025,14 +1025,14 @@ void LocationsBuilderARM64Sve::VisitVecDotProd(HVecDotProd* instruction) {
   locations->AddTemp(Location::RequiresFpuRegister());
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecDotProd(HVecDotProd* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecDotProd(HVecDotProd* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   DCHECK(locations->InAt(0).Equals(locations->Out()));
   const ZRegister acc = ZRegisterFrom(locations->InAt(0));
   const ZRegister left = ZRegisterFrom(locations->InAt(1));
   const ZRegister right = ZRegisterFrom(locations->InAt(2));
-  const PRegisterM p_reg = LoopPReg().Merging();
+  const PRegisterM p_reg = GetVecGoverningPReg(instruction).Merging();
   HVecOperation* a = instruction->InputAt(1)->AsVecOperation();
   HVecOperation* b = instruction->InputAt(2)->AsVecOperation();
   DCHECK_EQ(HVecOperation::ToSignedType(a->GetPackedType()),
@@ -1091,18 +1091,18 @@ static void CreateVecMemLocations(ArenaAllocator* allocator,
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecLoad(HVecLoad* instruction) {
+void LocationsBuilderARM64::SveVisitVecLoad(HVecLoad* instruction) {
   CreateVecMemLocations(GetGraph()->GetAllocator(), instruction, /*is_load*/ true);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecLoad(HVecLoad* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecLoad(HVecLoad* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   size_t size = DataType::Size(instruction->GetPackedType());
   const ZRegister reg = ZRegisterFrom(locations->Out());
   UseScratchRegisterScope temps(GetVIXLAssembler());
   Register scratch;
-  const PRegisterZ p_reg = LoopPReg().Zeroing();
+  const PRegisterZ p_reg = GetVecGoverningPReg(instruction).Zeroing();
   ValidateVectorLength(instruction);
 
   switch (instruction->GetPackedType()) {
@@ -1133,18 +1133,18 @@ void InstructionCodeGeneratorARM64Sve::VisitVecLoad(HVecLoad* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecStore(HVecStore* instruction) {
+void LocationsBuilderARM64::SveVisitVecStore(HVecStore* instruction) {
   CreateVecMemLocations(GetGraph()->GetAllocator(), instruction, /*is_load*/ false);
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecStore(HVecStore* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecStore(HVecStore* instruction) {
   DCHECK(instruction->IsPredicated());
   LocationSummary* locations = instruction->GetLocations();
   size_t size = DataType::Size(instruction->GetPackedType());
   const ZRegister reg = ZRegisterFrom(locations->InAt(2));
   UseScratchRegisterScope temps(GetVIXLAssembler());
   Register scratch;
-  const PRegisterZ p_reg = LoopPReg().Zeroing();
+  const PRegisterZ p_reg = GetVecGoverningPReg(instruction).Zeroing();
   ValidateVectorLength(instruction);
 
   switch (instruction->GetPackedType()) {
@@ -1175,35 +1175,35 @@ void InstructionCodeGeneratorARM64Sve::VisitVecStore(HVecStore* instruction) {
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+void LocationsBuilderARM64::SveVisitVecPredSetAll(HVecPredSetAll* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   DCHECK(instruction->InputAt(0)->IsIntConstant());
   locations->SetInAt(0, Location::NoLocation());
   locations->SetOut(Location::NoLocation());
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecPredSetAll(HVecPredSetAll* instruction) {
   // Instruction is not predicated, see nodes_vector.h
   DCHECK(!instruction->IsPredicated());
-  const PRegister p_reg = LoopPReg();
+  const PRegister output_p_reg = GetVecPredSetFixedOutPReg(instruction);
 
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
-      __ Ptrue(p_reg.VnB(), vixl::aarch64::SVE_ALL);
+      __ Ptrue(output_p_reg.VnB(), vixl::aarch64::SVE_ALL);
       break;
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
-      __ Ptrue(p_reg.VnH(), vixl::aarch64::SVE_ALL);
+      __ Ptrue(output_p_reg.VnH(), vixl::aarch64::SVE_ALL);
       break;
     case DataType::Type::kInt32:
     case DataType::Type::kFloat32:
-      __ Ptrue(p_reg.VnS(), vixl::aarch64::SVE_ALL);
+      __ Ptrue(output_p_reg.VnS(), vixl::aarch64::SVE_ALL);
       break;
     case DataType::Type::kInt64:
     case DataType::Type::kFloat64:
-      __ Ptrue(p_reg.VnD(), vixl::aarch64::SVE_ALL);
+      __ Ptrue(output_p_reg.VnD(), vixl::aarch64::SVE_ALL);
       break;
     default:
       LOG(FATAL) << "Unsupported SIMD type: " << instruction->GetPackedType();
@@ -1211,7 +1211,67 @@ void InstructionCodeGeneratorARM64Sve::VisitVecPredSetAll(HVecPredSetAll* instru
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecPredWhile(HVecPredWhile* instruction) {
+void LocationsBuilderARM64::SveVisitVecCondition(HVecCondition* instruction) {
+  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
+  locations->SetInAt(0, Location::RequiresFpuRegister());
+  locations->SetInAt(1, Location::RequiresFpuRegister());
+  locations->SetOut(Location::RequiresRegister());
+}
+
+void InstructionCodeGeneratorARM64::SveVisitVecCondition(HVecCondition* instruction) {
+  DCHECK(instruction->IsPredicated());
+  LocationSummary* locations = instruction->GetLocations();
+  const ZRegister left = ZRegisterFrom(locations->InAt(0));
+  const ZRegister right = ZRegisterFrom(locations->InAt(1));
+  const PRegisterZ p_reg = GetVecGoverningPReg(instruction).Zeroing();
+  const PRegister output_p_reg = GetVecPredSetFixedOutPReg(instruction);
+
+  HVecOperation* a = instruction->InputAt(0)->AsVecOperation();
+  HVecOperation* b = instruction->InputAt(1)->AsVecOperation();
+  DCHECK_EQ(HVecOperation::ToSignedType(a->GetPackedType()),
+            HVecOperation::ToSignedType(b->GetPackedType()));
+  ValidateVectorLength(instruction);
+
+  switch (instruction->GetPackedType()) {
+    case DataType::Type::kUint8:
+    case DataType::Type::kInt8:
+      __ Cmpeq(output_p_reg.VnB(), p_reg, left.VnB(), right.VnB());
+      break;
+    case DataType::Type::kUint16:
+    case DataType::Type::kInt16:
+      __ Cmpeq(output_p_reg.VnH(), p_reg, left.VnH(), right.VnH());
+      break;
+    case DataType::Type::kInt32:
+      __ Cmpeq(output_p_reg.VnS(), p_reg, left.VnS(), right.VnS());
+      break;
+    case DataType::Type::kInt64:
+      __ Cmpeq(output_p_reg.VnD(), p_reg, left.VnD(), right.VnD());
+      break;
+    default:
+      LOG(FATAL) << "Unsupported SIMD type: " << instruction->GetPackedType();
+      UNREACHABLE();
+  }
+}
+
+void LocationsBuilderARM64::SveVisitVecPredNot(HVecPredNot* instruction) {
+  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
+  DCHECK(instruction->InputAt(0)->IsVecPredSetOperation());
+  locations->SetInAt(0, Location::NoLocation());
+  locations->SetOut(Location::RequiresRegister());
+}
+
+void InstructionCodeGeneratorARM64::SveVisitVecPredNot(HVecPredNot* instruction) {
+  DCHECK(instruction->IsPredicated());
+
+  const PRegister input_p_reg = GetVecPredSetFixedOutPReg(
+      instruction->InputAt(0)->AsVecPredSetOperation());
+  const PRegister control_p_reg = GetVecGoverningPReg(instruction);
+  const PRegister output_p_reg = GetVecPredSetFixedOutPReg(instruction);
+
+  __ Not(output_p_reg.VnB(), control_p_reg.Zeroing(), input_p_reg.VnB());
+}
+
+void LocationsBuilderARM64::SveVisitVecPredWhile(HVecPredWhile* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetInAt(1, Location::RequiresRegister());
@@ -1221,8 +1281,8 @@ void LocationsBuilderARM64Sve::VisitVecPredWhile(HVecPredWhile* instruction) {
   // Semantically, the out location of this instruction and predicate inputs locations of
   // its users should be a fixed predicate register (similar to
   // Location::RegisterLocation(int reg)). But the register allocator (RA) doesn't support
-  // SIMD regs (e.g. predicate), so LoopPReg() is used explicitly without exposing it
-  // to the RA.
+  // SIMD regs (e.g. predicate), so fixed registers are used explicitly without exposing it
+  // to the RA (through GetVecPredSetFixedOutPReg()).
   //
   // To make the RA happy Location::NoLocation() was used for all the vector instructions
   // predicate inputs; but for the PredSetOperations (e.g. VecPredWhile) Location::NoLocation()
@@ -1237,28 +1297,29 @@ void LocationsBuilderARM64Sve::VisitVecPredWhile(HVecPredWhile* instruction) {
   locations->SetOut(Location::RequiresRegister());
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecPredWhile(HVecPredWhile* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecPredWhile(HVecPredWhile* instruction) {
   // Instruction is not predicated, see nodes_vector.h
   DCHECK(!instruction->IsPredicated());
   // Current implementation of predicated loop execution only supports kLO condition.
   DCHECK(instruction->GetCondKind() == HVecPredWhile::CondKind::kLO);
   Register left = InputRegisterAt(instruction, 0);
   Register right = InputRegisterAt(instruction, 1);
+  const PRegister output_p_reg = GetVecPredSetFixedOutPReg(instruction);
 
-  DCHECK_EQ(codegen_->GetSIMDRegisterWidth() % instruction->GetVectorLength(), 0u);
+  DCHECK_EQ(codegen_->GetPredicatedSIMDRegisterWidth() % instruction->GetVectorLength(), 0u);
 
-  switch (codegen_->GetSIMDRegisterWidth() / instruction->GetVectorLength()) {
+  switch (codegen_->GetPredicatedSIMDRegisterWidth() / instruction->GetVectorLength()) {
     case 1u:
-      __ Whilelo(LoopPReg().VnB(), left, right);
+      __ Whilelo(output_p_reg.VnB(), left, right);
       break;
     case 2u:
-      __ Whilelo(LoopPReg().VnH(), left, right);
+      __ Whilelo(output_p_reg.VnH(), left, right);
       break;
     case 4u:
-      __ Whilelo(LoopPReg().VnS(), left, right);
+      __ Whilelo(output_p_reg.VnS(), left, right);
       break;
     case 8u:
-      __ Whilelo(LoopPReg().VnD(), left, right);
+      __ Whilelo(output_p_reg.VnD(), left, right);
       break;
     default:
       LOG(FATAL) << "Unsupported SIMD type: " << instruction->GetPackedType();
@@ -1266,44 +1327,44 @@ void InstructionCodeGeneratorARM64Sve::VisitVecPredWhile(HVecPredWhile* instruct
   }
 }
 
-void LocationsBuilderARM64Sve::VisitVecPredCondition(HVecPredCondition* instruction) {
+void LocationsBuilderARM64::SveVisitVecPredToBoolean(HVecPredToBoolean* instruction) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
   locations->SetInAt(0, Location::NoLocation());
   // Result of the operation - a boolean value in a core register.
   locations->SetOut(Location::RequiresRegister());
 }
 
-void InstructionCodeGeneratorARM64Sve::VisitVecPredCondition(HVecPredCondition* instruction) {
+void InstructionCodeGeneratorARM64::SveVisitVecPredToBoolean(HVecPredToBoolean* instruction) {
   // Instruction is not predicated, see nodes_vector.h
   DCHECK(!instruction->IsPredicated());
   Register reg = OutputRegister(instruction);
-  // Currently VecPredCondition is only used as part of vectorized loop check condition
+  // Currently VecPredToBoolean is only used as part of vectorized loop check condition
   // evaluation.
-  DCHECK(instruction->GetPCondKind() == HVecPredCondition::PCondKind::kNFirst);
+  DCHECK(instruction->GetPCondKind() == HVecPredToBoolean::PCondKind::kNFirst);
   __ Cset(reg, pl);
 }
 
-Location InstructionCodeGeneratorARM64Sve::AllocateSIMDScratchLocation(
+Location InstructionCodeGeneratorARM64::SveAllocateSIMDScratchLocation(
     vixl::aarch64::UseScratchRegisterScope* scope) {
   return LocationFrom(scope->AcquireZ());
 }
 
-void InstructionCodeGeneratorARM64Sve::FreeSIMDScratchLocation(Location loc,
+void InstructionCodeGeneratorARM64::SveFreeSIMDScratchLocation(Location loc,
     vixl::aarch64::UseScratchRegisterScope* scope) {
   scope->Release(ZRegisterFrom(loc));
 }
 
-void InstructionCodeGeneratorARM64Sve::LoadSIMDRegFromStack(Location destination,
+void InstructionCodeGeneratorARM64::SveLoadSIMDRegFromStack(Location destination,
                                                             Location source) {
   __ Ldr(ZRegisterFrom(destination), SveStackOperandFrom(source));
 }
 
-void InstructionCodeGeneratorARM64Sve::MoveSIMDRegToSIMDReg(Location destination,
+void InstructionCodeGeneratorARM64::SveMoveSIMDRegToSIMDReg(Location destination,
                                                             Location source) {
   __ Mov(ZRegisterFrom(destination), ZRegisterFrom(source));
 }
 
-void InstructionCodeGeneratorARM64Sve::MoveToSIMDStackSlot(Location destination,
+void InstructionCodeGeneratorARM64::SveMoveToSIMDStackSlot(Location destination,
                                                            Location source) {
   DCHECK(destination.IsSIMDStackSlot());
 
@@ -1315,10 +1376,10 @@ void InstructionCodeGeneratorARM64Sve::MoveToSIMDStackSlot(Location destination,
     if (GetVIXLAssembler()->GetScratchVRegisterList()->IsEmpty()) {
       // Very rare situation, only when there are cycles in ParallelMoveResolver graph.
       const Register temp = temps.AcquireX();
-      DCHECK_EQ(codegen_->GetSIMDRegisterWidth() % kArm64WordSize, 0u);
+      DCHECK_EQ(codegen_->GetPredicatedSIMDRegisterWidth() % kArm64WordSize, 0u);
       // Emit a number of LDR/STR (XRegister, 64-bit) to cover the whole SIMD register size
       // when copying a stack slot.
-      for (size_t offset = 0, e = codegen_->GetSIMDRegisterWidth();
+      for (size_t offset = 0, e = codegen_->GetPredicatedSIMDRegisterWidth();
            offset < e;
            offset += kArm64WordSize) {
         __ Ldr(temp, MemOperand(sp, source.GetStackIndex() + offset));
@@ -1372,12 +1433,12 @@ void SaveRestoreLiveRegistersHelperSveImpl(CodeGeneratorARM64* codegen,
   }
 }
 
-void InstructionCodeGeneratorARM64Sve::SaveLiveRegistersHelper(LocationSummary* locations,
+void InstructionCodeGeneratorARM64::SveSaveLiveRegistersHelper(LocationSummary* locations,
                                                                int64_t spill_offset) {
   SaveRestoreLiveRegistersHelperSveImpl</* is_save= */ true>(codegen_, locations, spill_offset);
 }
 
-void InstructionCodeGeneratorARM64Sve::RestoreLiveRegistersHelper(LocationSummary* locations,
+void InstructionCodeGeneratorARM64::SveRestoreLiveRegistersHelper(LocationSummary* locations,
                                                                   int64_t spill_offset) {
   SaveRestoreLiveRegistersHelperSveImpl</* is_save= */ false>(codegen_, locations, spill_offset);
 }

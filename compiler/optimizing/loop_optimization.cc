@@ -366,13 +366,6 @@ static bool HasVectorRestrictions(uint64_t restrictions, uint64_t tested) {
   return (restrictions & tested) != 0;
 }
 
-// Insert an instruction.
-static HInstruction* Insert(HBasicBlock* block, HInstruction* instruction) {
-  DCHECK(block != nullptr);
-  DCHECK(instruction != nullptr);
-  block->InsertInstructionBefore(instruction, block->GetLastInstruction());
-  return instruction;
-}
 
 // Check that instructions from the induction sets are fully removed: have no uses
 // and no other instructions use them.
@@ -453,6 +446,54 @@ static DataType::Type GetNarrowerType(HInstruction* a, HInstruction* b) {
   return type;
 }
 
+// Returns whether the loop is of a diamond structure:
+//
+//                header------------------+
+//                  |                     |
+//             diamond_hif                |
+//                /   \                   |
+//     diamond_true  diamond_false        |
+//                \   /                   |
+//              back_edge                 |
+//                  |                     |
+//                  +---------------------+
+static bool HasLoopDiamondStructure(HLoopInformation* loop_info) {
+  HBasicBlock* header = loop_info->GetHeader();
+  if (loop_info->NumberOfBackEdges() != 1 || header->GetSuccessors().size() != 2) {
+    return false;
+  }
+  HBasicBlock* header_succ_0 = header->GetSuccessors()[0];
+  HBasicBlock* header_succ_1 = header->GetSuccessors()[1];
+  HBasicBlock* diamond_top = loop_info->Contains(*header_succ_0) ?
+                                  header_succ_0 :
+                                  header_succ_1;
+  if (!diamond_top->GetLastInstruction()->IsIf()) {
+    return false;
+  }
+
+  HIf* diamond_hif = diamond_top->GetLastInstruction()->AsIf();
+  HBasicBlock* diamond_true = diamond_hif->IfTrueSuccessor();
+  HBasicBlock* diamond_false = diamond_hif->IfFalseSuccessor();
+
+  if (diamond_true->GetSuccessors().size() != 1 || diamond_false->GetSuccessors().size() != 1) {
+    return false;
+  }
+
+  HBasicBlock* back_edge = diamond_true->GetSingleSuccessor();
+  if (back_edge != diamond_false->GetSingleSuccessor() ||
+      back_edge != loop_info->GetBackEdges()[0]) {
+    return false;
+  }
+
+  DCHECK_EQ(loop_info->GetBlocks().NumSetBits(), 5u);
+  return true;
+}
+
+static bool IsPredicatedLoopControlFlowSupported(HLoopInformation* loop_info) {
+  size_t num_of_blocks = loop_info->GetBlocks().NumSetBits();
+  return num_of_blocks == 2 || HasLoopDiamondStructure(loop_info);
+}
+
 //
 // Public methods.
 //
@@ -464,7 +505,9 @@ HLoopOptimization::HLoopOptimization(HGraph* graph,
                                      const char* name)
     : HOptimization(graph, name, stats),
       compiler_options_(&codegen.GetCompilerOptions()),
-      simd_register_size_(codegen.GetSIMDRegisterWidth()),
+      codegen_supports_predicated_simd_(codegen.SupportsPredicatedSIMD()),
+      traditional_simd_register_size_(codegen.GetTraditionalSIMDRegisterWidth()),
+      predicated_simd_register_size_(codegen.GetPredicatedSIMDRegisterWidth()),
       induction_range_(induction_analysis),
       loop_allocator_(nullptr),
       global_allocator_(graph_->GetAllocator()),
@@ -473,7 +516,6 @@ HLoopOptimization::HLoopOptimization(HGraph* graph,
       iset_(nullptr),
       reductions_(nullptr),
       simplified_(false),
-      predicated_vectorization_mode_(codegen.SupportsPredicatedSIMD()),
       vector_length_(0),
       vector_refs_(nullptr),
       vector_static_peeling_factor_(0),
@@ -482,7 +524,10 @@ HLoopOptimization::HLoopOptimization(HGraph* graph,
       vector_runtime_test_b_(nullptr),
       vector_map_(nullptr),
       vector_permanent_map_(nullptr),
-      vector_mode_(kSequential),
+      vector_external_set_(nullptr),
+      predicate_info_map_(nullptr),
+      vectorization_mode_(VectorizationMode::kTraditional),
+      synthesis_mode_(LoopSynthesisMode::kSequential),
       vector_preheader_(nullptr),
       vector_header_(nullptr),
       vector_body_(nullptr),
@@ -547,12 +592,17 @@ bool HLoopOptimization::LocalRun() {
       std::less<HInstruction*>(), loop_allocator_->Adapter(kArenaAllocLoopOptimization));
   ScopedArenaSafeMap<HInstruction*, HInstruction*> perm(
       std::less<HInstruction*>(), loop_allocator_->Adapter(kArenaAllocLoopOptimization));
+  ScopedArenaSet<HInstruction*> ext_set(loop_allocator_->Adapter(kArenaAllocLoopOptimization));
+  ScopedArenaSafeMap<HBasicBlock*, BlockPredicateInfo*> pred(
+      std::less<HBasicBlock*>(), loop_allocator_->Adapter(kArenaAllocLoopOptimization));
   // Attach.
   iset_ = &iset;
   reductions_ = &reds;
   vector_refs_ = &refs;
   vector_map_ = &map;
   vector_permanent_map_ = &perm;
+  vector_external_set_ = &ext_set;
+  predicate_info_map_ = &pred;
   // Traverse.
   const bool did_loop_opt = TraverseLoopsInnerToOuter(top_loop_);
   // Detach.
@@ -561,6 +611,9 @@ bool HLoopOptimization::LocalRun() {
   vector_refs_ = nullptr;
   vector_map_ = nullptr;
   vector_permanent_map_ = nullptr;
+  vector_external_set_ = nullptr;
+  predicate_info_map_ = nullptr;
+
   return did_loop_opt;
 }
 
@@ -748,6 +801,44 @@ void HLoopOptimization::SimplifyBlocks(LoopNode* node) {
   }
 }
 
+// Checks whether the loop has exit structure suitable for InnerLoopFinite optimization:
+//  - has single loop exit.
+//  - the exit block has only single predecessor - a block inside the loop.
+//
+// In that case returns single exit basic block (outside the loop); otherwise nullptr.
+static HBasicBlock* GetInnerLoopFiniteSingleExit(HLoopInformation* loop_info) {
+  HBasicBlock* exit = nullptr;
+  for (HBlocksInLoopIterator block_it(*loop_info);
+       !block_it.Done();
+       block_it.Advance()) {
+    HBasicBlock* block = block_it.Current();
+
+    // Check whether one of the successor is loop exit.
+    for (HBasicBlock* successor : block->GetSuccessors()) {
+      if (!loop_info->Contains(*successor)) {
+        if (exit != nullptr) {
+          // The loop has more than one exit.
+          return nullptr;
+        }
+        exit = successor;
+
+        // Ensure exit can only be reached by exiting loop.
+        if (successor->GetPredecessors().size() != 1) {
+          return nullptr;
+        }
+      }
+    }
+  }
+  return exit;
+}
+
+// Determines whether predicated loop vectorization should be tried for ALL loops.
+#ifdef ART_FORCE_TRY_PREDICATED_SIMD
+  static constexpr bool kForceTryPredicatedSIMD = true;
+#else
+  static constexpr bool kForceTryPredicatedSIMD = false;
+#endif
+
 bool HLoopOptimization::TryOptimizeInnerLoopFinite(LoopNode* node) {
   HBasicBlock* header = node->loop_info->GetHeader();
   HBasicBlock* preheader = node->loop_info->GetPreHeader();
@@ -756,33 +847,22 @@ bool HLoopOptimization::TryOptimizeInnerLoopFinite(LoopNode* node) {
   if (!induction_range_.IsFinite(node->loop_info, &trip_count)) {
     return false;
   }
-  // Ensure there is only a single loop-body (besides the header).
-  HBasicBlock* body = nullptr;
-  for (HBlocksInLoopIterator it(*node->loop_info); !it.Done(); it.Advance()) {
-    if (it.Current() != header) {
-      if (body != nullptr) {
-        return false;
-      }
-      body = it.Current();
-    }
-  }
-  CHECK(body != nullptr);
-  // Ensure there is only a single exit point.
-  if (header->GetSuccessors().size() != 2) {
+  // Check loop exits.
+  HBasicBlock* exit = GetInnerLoopFiniteSingleExit(node->loop_info);
+  if (exit == nullptr) {
     return false;
   }
-  HBasicBlock* exit = (header->GetSuccessors()[0] == body)
-      ? header->GetSuccessors()[1]
-      : header->GetSuccessors()[0];
-  // Ensure exit can only be reached by exiting loop.
-  if (exit->GetPredecessors().size() != 1) {
-    return false;
-  }
+
+  HBasicBlock* body = (header->GetSuccessors()[0] == exit)
+    ? header->GetSuccessors()[1]
+    : header->GetSuccessors()[0];
   // Detect either an empty loop (no side effects other than plain iteration) or
   // a trivial loop (just iterating once). Replace subsequent index uses, if any,
   // with the last value and remove the loop, possibly after unrolling its body.
   HPhi* main_phi = nullptr;
-  if (TrySetSimpleLoopHeader(header, &main_phi)) {
+  size_t num_of_blocks = header->GetLoopInformation()->GetBlocks().NumSetBits();
+
+  if (num_of_blocks == 2 && TrySetSimpleLoopHeader(header, &main_phi)) {
     bool is_empty = IsEmptyBody(body);
     if (reductions_->empty() &&  // TODO: possible with some effort
         (is_empty || trip_count == 1) &&
@@ -806,21 +886,68 @@ bool HLoopOptimization::TryOptimizeInnerLoopFinite(LoopNode* node) {
     }
   }
   // Vectorize loop, if possible and valid.
-  if (kEnableVectorization &&
+  if (!kEnableVectorization ||
       // Disable vectorization for debuggable graphs: this is a workaround for the bug
       // in 'GenerateNewLoop' which caused the SuspendCheck environment to be invalid.
       // TODO: b/138601207, investigate other possible cases with wrong environment values and
       // possibly switch back vectorization on for debuggable graphs.
-      !graph_->IsDebuggable() &&
-      TrySetSimpleLoopHeader(header, &main_phi) &&
-      ShouldVectorize(node, body, trip_count) &&
-      TryAssignLastValue(node->loop_info, main_phi, preheader, /*collect_loop_uses*/ true)) {
-    Vectorize(node, body, exit, trip_count);
-    graph_->SetHasSIMD(true);  // flag SIMD usage
-    MaybeRecordStat(stats_, MethodCompilationStat::kLoopVectorized);
-    return true;
+      graph_->IsDebuggable()) {
+    return false;
   }
-  return false;
+
+  if (kForceTryPredicatedSIMD) {
+    return TryVectorizePredicated(node, body, exit, main_phi,  trip_count);
+  } else {
+    return TryVectorizedTraditional(node, body, exit, main_phi, trip_count) ||
+           TryVectorizePredicated(node, body, exit, main_phi,  trip_count);
+  }
+}
+
+bool HLoopOptimization::TryVectorizePredicated(LoopNode* node,
+                                               HBasicBlock* body,
+                                               HBasicBlock* exit,
+                                               HPhi* main_phi,
+                                               int64_t trip_count) {
+  vectorization_mode_ = VectorizationMode::kPredicated;
+
+  if (!codegen_supports_predicated_simd_ ||
+      !IsPredicatedLoopControlFlowSupported(node->loop_info) ||
+      !CanAndShouldVectorizeCommon(node, main_phi, trip_count, /* enable_peeling */ false)) {
+    return false;
+  }
+
+  // Currently we can only generate cleanup loops for loops with 2 basic block.
+  //
+  // TODO: Support array disambiguation tests for CF loops.
+  if (NeedsArrayRefsDisambiguationTest() &&
+      node->loop_info->GetBlocks().NumSetBits() != 2) {
+    return false;
+  }
+
+  VectorizePredicated(node, body, exit);
+  MaybeRecordStat(stats_, MethodCompilationStat::kLoopVectorized);
+  graph_->SetHasPredicatedSIMD(true);  // flag SIMD usage
+  return true;
+}
+
+bool HLoopOptimization::TryVectorizedTraditional(LoopNode* node,
+                                                 HBasicBlock* body,
+                                                 HBasicBlock* exit,
+                                                 HPhi* main_phi,
+                                                 int64_t trip_count) {
+  vectorization_mode_ = VectorizationMode::kTraditional;
+
+  HBasicBlock* header = node->loop_info->GetHeader();
+  size_t num_of_blocks = header->GetLoopInformation()->GetBlocks().NumSetBits();
+
+  if (num_of_blocks != 2 ||
+      !CanAndShouldVectorizeCommon(node, main_phi, trip_count, /* enable_peeling */ true)) {
+    return false;
+  }
+  VectorizeTraditional(node, body, exit, trip_count);
+  MaybeRecordStat(stats_, MethodCompilationStat::kLoopVectorized);
+  graph_->SetHasTraditionalSIMD(true);  // flag SIMD usage
+  return true;
 }
 
 bool HLoopOptimization::OptimizeInnerLoop(LoopNode* node) {
@@ -961,7 +1088,7 @@ bool HLoopOptimization::TryPeelingAndUnrolling(LoopNode* node) {
 // Intel Press, June, 2004 (http://www.aartbik.com/).
 //
 
-bool HLoopOptimization::ShouldVectorize(LoopNode* node, HBasicBlock* block, int64_t trip_count) {
+bool HLoopOptimization::CanVectorizeDataFlow(LoopNode* node, HBasicBlock* header) {
   // Reset vector bookkeeping.
   vector_length_ = 0;
   vector_refs_->clear();
@@ -970,16 +1097,29 @@ bool HLoopOptimization::ShouldVectorize(LoopNode* node, HBasicBlock* block, int6
   vector_runtime_test_a_ =
   vector_runtime_test_b_ = nullptr;
 
-  // Phis in the loop-body prevent vectorization.
-  if (!block->GetPhis().IsEmpty()) {
-    return false;
-  }
+  for (HBlocksInLoopIterator block_it(*header->GetLoopInformation());
+       !block_it.Done();
+       block_it.Advance()) {
+    HBasicBlock* block = block_it.Current();
 
-  // Scan the loop-body, starting a right-hand-side tree traversal at each left-hand-side
-  // occurrence, which allows passing down attributes down the use tree.
-  for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
-    if (!VectorizeDef(node, it.Current(), /*generate_code*/ false)) {
-      return false;  // failure to vectorize a left-hand-side
+    if (block == header) {
+      // The header is of a certain structure (TrySetSimpleLoopHeader) and doesn't need to be
+      // processed here.
+      continue;
+    }
+
+    // Phis in the loop-body prevent vectorization.
+    // TODO: Enable vectorization of CF loops with Phis.
+    if (!block->GetPhis().IsEmpty()) {
+      return false;
+    }
+
+    // Scan the loop-body instructions, starting a right-hand-side tree traversal at each
+    // left-hand-side occurrence, which allows passing down attributes down the use tree.
+    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+      if (!VectorizeDef(node, it.Current(), /*generate_code*/ false)) {
+        return false;  // failure to vectorize a left-hand-side
+      }
     }
   }
 
@@ -1066,24 +1206,120 @@ bool HLoopOptimization::ShouldVectorize(LoopNode* node, HBasicBlock* block, int6
     }
   }  // for i
 
-  if (!IsInPredicatedVectorizationMode()) {
-    // Find a suitable alignment strategy.
-    SetAlignmentStrategy(peeling_votes, peeling_candidate);
-  }
-
-  // Does vectorization seem profitable?
-  if (!IsVectorizationProfitable(trip_count)) {
-    return false;
-  }
+  // Update the info on alignment strategy anyway, we could decide not to use it later.
+  SetAlignmentStrategy(peeling_votes, peeling_candidate);
 
   // Success!
   return true;
 }
 
-void HLoopOptimization::Vectorize(LoopNode* node,
-                                  HBasicBlock* block,
-                                  HBasicBlock* exit,
-                                  int64_t trip_count) {
+bool HLoopOptimization::CanAndShouldVectorizeCommon(LoopNode* node,
+                                                    HPhi* main_phi,
+                                                    int64_t trip_count,
+                                                    bool enable_peeling) {
+  HBasicBlock* header = node->loop_info->GetHeader();
+  HBasicBlock* preheader = node->loop_info->GetPreHeader();
+
+  if (!TrySetSimpleLoopHeader(header, &main_phi) ||
+      !CanVectorizeDataFlow(node, header)) {
+    return false;
+  }
+
+  if (!IsVectorizationProfitable(trip_count, enable_peeling) ||
+      !TryAssignLastValue(node->loop_info, main_phi, preheader, /*collect_loop_uses*/ true)) {
+    return false;
+  }
+
+  return true;
+}
+
+void HLoopOptimization::VectorizePredicated(LoopNode* node,
+                                            HBasicBlock* block,
+                                            HBasicBlock* exit) {
+  HBasicBlock* header = node->loop_info->GetHeader();
+  HBasicBlock* preheader = node->loop_info->GetPreHeader();
+
+  // Adjust vector bookkeeping.
+  HPhi* main_phi = nullptr;
+  bool is_simple_loop_header = TrySetSimpleLoopHeader(header, &main_phi);  // refills sets
+  DCHECK(is_simple_loop_header);
+  vector_header_ = header;
+  vector_body_ = block;
+
+  // Loop induction type.
+  DataType::Type induc_type = main_phi->GetType();
+  DCHECK(induc_type == DataType::Type::kInt32 || induc_type == DataType::Type::kInt64)
+      << induc_type;
+
+  // Generate loop control:
+  // stc = <trip-count>;
+  // vtc = <vector trip-count>
+  HInstruction* stc = induction_range_.GenerateTripCount(node->loop_info, graph_, preheader);
+  HInstruction* vtc = stc;
+  vector_index_ = graph_->GetConstant(induc_type, 0);
+  bool needs_disambiguation_test = false;
+  // Generate runtime disambiguation test:
+  // vtc = a != b ? vtc : 0;
+  if (NeedsArrayRefsDisambiguationTest()) {
+    HInstruction* rt = Insert(
+        preheader,
+        new (global_allocator_) HNotEqual(vector_runtime_test_a_, vector_runtime_test_b_));
+    vtc = Insert(preheader,
+                 new (global_allocator_)
+                 HSelect(rt, vtc, graph_->GetConstant(induc_type, 0), kNoDexPc));
+    needs_disambiguation_test = true;
+  }
+
+  // Generate vector loop:
+  // for ( ; i < vtc; i += vector_length)
+  //    <vectorized-loop-body>
+  HBasicBlock* new_preheader =
+      graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit);
+  synthesis_mode_ = LoopSynthesisMode::kVector;
+  GenerateNewLoopPredicated(node,
+                            new_preheader,
+                            vector_index_,
+                            vtc,
+                            graph_->GetConstant(induc_type, vector_length_));
+
+  // Generate scalar loop, if needed:
+  // for ( ; i < stc; i += 1)
+  //    <loop-body>
+  if (needs_disambiguation_test) {
+    synthesis_mode_ = LoopSynthesisMode::kSequential;
+    new_preheader =
+        graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit);
+    // Use "Traditional" version for the sequential loop.
+    GenerateNewLoopTraditional(node,
+                               new_preheader,
+                               vector_index_,
+                               stc,
+                               graph_->GetConstant(induc_type, 1),
+                               LoopAnalysisInfo::kNoUnrollingFactor);
+  }
+
+  FinalizeVectorization(node);
+
+  // Assign governing predicates for the predicated instructions inserted during vectorization
+  // outside the loop.
+  for (auto it : *vector_external_set_) {
+    DCHECK(it->IsVecOperation());
+    HVecOperation* vec_op = it->AsVecOperation();
+
+    HVecPredSetAll* set_pred = new (global_allocator_) HVecPredSetAll(global_allocator_,
+                                                                      graph_->GetIntConstant(1),
+                                                                      vec_op->GetPackedType(),
+                                                                      vec_op->GetVectorLength(),
+                                                                      0u);
+    vec_op->GetBlock()->InsertInstructionBefore(set_pred, vec_op);
+    vec_op->SetMergingGoverningPredicate(set_pred);
+  }
+}
+
+void HLoopOptimization::VectorizeTraditional(LoopNode* node,
+                                             HBasicBlock* block,
+                                             HBasicBlock* exit,
+                                             int64_t trip_count) {
   HBasicBlock* header = node->loop_info->GetHeader();
   HBasicBlock* preheader = node->loop_info->GetPreHeader();
 
@@ -1096,7 +1332,7 @@ void HLoopOptimization::Vectorize(LoopNode* node,
 
   // A cleanup loop is needed, at least, for any unknown trip count or
   // for a known trip count with remainder iterations after vectorization.
-  bool needs_cleanup = !IsInPredicatedVectorizationMode() &&
+  bool needs_cleanup =
       (trip_count == 0 || ((trip_count - vector_static_peeling_factor_) % chunk) != 0);
 
   // Adjust vector bookkeeping.
@@ -1115,13 +1351,11 @@ void HLoopOptimization::Vectorize(LoopNode* node,
   // ptc = <peeling factor>;
   HInstruction* ptc = nullptr;
   if (vector_static_peeling_factor_ != 0) {
-    DCHECK(!IsInPredicatedVectorizationMode());
     // Static loop peeling for SIMD alignment (using the most suitable
     // fixed peeling factor found during prior alignment analysis).
     DCHECK(vector_dynamic_peeling_candidate_ == nullptr);
     ptc = graph_->GetConstant(induc_type, vector_static_peeling_factor_);
   } else if (vector_dynamic_peeling_candidate_ != nullptr) {
-    DCHECK(!IsInPredicatedVectorizationMode());
     // Dynamic loop peeling for SIMD alignment (using the most suitable
     // candidate found during prior alignment analysis):
     // rem = offset % ALIGN;    // adjusted as #elements
@@ -1152,7 +1386,6 @@ void HLoopOptimization::Vectorize(LoopNode* node,
   HInstruction* stc = induction_range_.GenerateTripCount(node->loop_info, graph_, preheader);
   HInstruction* vtc = stc;
   if (needs_cleanup) {
-    DCHECK(!IsInPredicatedVectorizationMode());
     DCHECK(IsPowerOfTwo(chunk));
     HInstruction* diff = stc;
     if (ptc != nullptr) {
@@ -1172,7 +1405,7 @@ void HLoopOptimization::Vectorize(LoopNode* node,
 
   // Generate runtime disambiguation test:
   // vtc = a != b ? vtc : 0;
-  if (vector_runtime_test_a_ != nullptr) {
+  if (NeedsArrayRefsDisambiguationTest()) {
     HInstruction* rt = Insert(
         preheader,
         new (global_allocator_) HNotEqual(vector_runtime_test_a_, vector_runtime_test_b_));
@@ -1189,46 +1422,54 @@ void HLoopOptimization::Vectorize(LoopNode* node,
   // NOTE: The alignment forced by the peeling loop is preserved even if data is
   //       moved around during suspend checks, since all analysis was based on
   //       nothing more than the Android runtime alignment conventions.
+  HBasicBlock* new_preheader = nullptr;
   if (ptc != nullptr) {
-    DCHECK(!IsInPredicatedVectorizationMode());
-    vector_mode_ = kSequential;
-    GenerateNewLoop(node,
-                    block,
-                    graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit),
-                    vector_index_,
-                    ptc,
-                    graph_->GetConstant(induc_type, 1),
-                    LoopAnalysisInfo::kNoUnrollingFactor);
+    synthesis_mode_ = LoopSynthesisMode::kSequential;
+    new_preheader =
+        graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit);
+    GenerateNewLoopTraditional(node,
+                               new_preheader,
+                               vector_index_,
+                               ptc,
+                               graph_->GetConstant(induc_type, 1),
+                               LoopAnalysisInfo::kNoUnrollingFactor);
   }
 
   // Generate vector loop, possibly further unrolled:
   // for ( ; i < vtc; i += chunk)
   //    <vectorized-loop-body>
-  vector_mode_ = kVector;
-  GenerateNewLoop(node,
-                  block,
-                  graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit),
-                  vector_index_,
-                  vtc,
-                  graph_->GetConstant(induc_type, vector_length_),  // increment per unroll
-                  unroll);
-  HLoopInformation* vloop = vector_header_->GetLoopInformation();
+  synthesis_mode_ = LoopSynthesisMode::kVector;
+  new_preheader =
+      graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit);
+  GenerateNewLoopTraditional(node,
+                             new_preheader,
+                             vector_index_,
+                             vtc,
+                             graph_->GetConstant(induc_type, vector_length_),  // per unroll
+                             unroll);
 
   // Generate cleanup loop, if needed:
   // for ( ; i < stc; i += 1)
   //    <loop-body>
   if (needs_cleanup) {
-    DCHECK_IMPLIES(IsInPredicatedVectorizationMode(), vector_runtime_test_a_ != nullptr);
-    vector_mode_ = kSequential;
-    GenerateNewLoop(node,
-                    block,
-                    graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit),
-                    vector_index_,
-                    stc,
-                    graph_->GetConstant(induc_type, 1),
-                    LoopAnalysisInfo::kNoUnrollingFactor);
+    synthesis_mode_ = LoopSynthesisMode::kSequential;
+    new_preheader =
+        graph_->TransformLoopForVectorization(vector_header_, vector_body_, exit);
+    GenerateNewLoopTraditional(node,
+                               new_preheader,
+                               vector_index_,
+                               stc,
+                               graph_->GetConstant(induc_type, 1),
+                               LoopAnalysisInfo::kNoUnrollingFactor);
   }
 
+  FinalizeVectorization(node);
+}
+
+void HLoopOptimization::FinalizeVectorization(LoopNode* node) {
+  HBasicBlock* header = node->loop_info->GetHeader();
+  HBasicBlock* preheader = node->loop_info->GetPreHeader();
+  HLoopInformation* vloop = vector_header_->GetLoopInformation();
   // Link reductions to their final uses.
   for (auto i = reductions_->begin(); i != reductions_->end(); ++i) {
     if (i->first->IsPhi()) {
@@ -1242,9 +1483,17 @@ void HLoopOptimization::Vectorize(LoopNode* node,
     }
   }
 
-  // Remove the original loop by disconnecting the body block
-  // and removing all instructions from the header.
-  block->DisconnectAndDelete();
+  // Remove the original loop.
+  for (HBlocksInLoopPostOrderIterator it_loop(*node->loop_info);
+       !it_loop.Done();
+       it_loop.Advance()) {
+    HBasicBlock* cur_block = it_loop.Current();
+    if (cur_block == node->loop_info->GetHeader()) {
+      continue;
+    }
+    cur_block->DisconnectAndDelete();
+  }
+
   while (!header->GetFirstInstruction()->IsGoto()) {
     header->RemoveInstruction(header->GetFirstInstruction());
   }
@@ -1256,14 +1505,7 @@ void HLoopOptimization::Vectorize(LoopNode* node,
   node->loop_info = vloop;
 }
 
-void HLoopOptimization::GenerateNewLoop(LoopNode* node,
-                                        HBasicBlock* block,
-                                        HBasicBlock* new_preheader,
-                                        HInstruction* lo,
-                                        HInstruction* hi,
-                                        HInstruction* step,
-                                        uint32_t unroll) {
-  DCHECK(unroll == 1 || vector_mode_ == kVector);
+HPhi* HLoopOptimization::InitializeForNewLoop(HBasicBlock* new_preheader, HInstruction* lo) {
   DataType::Type induc_type = lo->GetType();
   // Prepare new loop.
   vector_preheader_ = new_preheader,
@@ -1273,68 +1515,147 @@ void HLoopOptimization::GenerateNewLoop(LoopNode* node,
                                            kNoRegNumber,
                                            0,
                                            HPhi::ToPhiType(induc_type));
-  // Generate header and prepare body.
-  // for (i = lo; i < hi; i += step)
-  //    <loop-body>
-  HInstruction* cond = nullptr;
-  HInstruction* set_pred = nullptr;
-  if (IsInPredicatedVectorizationMode()) {
-    HVecPredWhile* pred_while =
-        new (global_allocator_) HVecPredWhile(global_allocator_,
-                                              phi,
-                                              hi,
-                                              HVecPredWhile::CondKind::kLO,
-                                              DataType::Type::kInt32,
-                                              vector_length_,
-                                              0u);
+  vector_header_->AddPhi(phi);
+  vector_index_ = phi;
+  vector_permanent_map_->clear();
+  vector_external_set_->clear();
+  predicate_info_map_->clear();
 
-    cond = new (global_allocator_) HVecPredCondition(global_allocator_,
-                                                     pred_while,
-                                                     HVecPredCondition::PCondKind::kNFirst,
-                                                     DataType::Type::kInt32,
-                                                     vector_length_,
-                                                     0u);
+  return phi;
+}
 
-    vector_header_->AddPhi(phi);
-    vector_header_->AddInstruction(pred_while);
-    vector_header_->AddInstruction(cond);
-    set_pred = pred_while;
-  } else {
-    cond = new (global_allocator_) HAboveOrEqual(phi, hi);
-    vector_header_->AddPhi(phi);
-    vector_header_->AddInstruction(cond);
+void HLoopOptimization::GenerateNewLoopTraditional(LoopNode* node,
+                                                   HBasicBlock* new_preheader,
+                                                   HInstruction* lo,
+                                                   HInstruction* hi,
+                                                   HInstruction* step,
+                                                   uint32_t unroll) {
+  DCHECK(unroll == 1 || synthesis_mode_ == LoopSynthesisMode::kVector);
+  DataType::Type induc_type = lo->GetType();
+  HPhi* phi = InitializeForNewLoop(new_preheader, lo);
+
+  // Generate loop exit check.
+  HInstruction* cond = new (global_allocator_) HAboveOrEqual(phi, hi);
+  vector_header_->AddInstruction(cond);
+  vector_header_->AddInstruction(new (global_allocator_) HIf(cond));
+
+  for (uint32_t u = 0; u < unroll; u++) {
+    GenerateNewLoopBodyOnce(node, induc_type, step);
   }
 
+  FinalizePhisForNewLoop(phi, lo);
+}
+
+void HLoopOptimization::GenerateNewLoopPredicated(LoopNode* node,
+                                                  HBasicBlock* new_preheader,
+                                                  HInstruction* lo,
+                                                  HInstruction* hi,
+                                                  HInstruction* step) {
+  DCHECK(synthesis_mode_ == LoopSynthesisMode::kVector);
+  DataType::Type induc_type = lo->GetType();
+  HPhi* phi = InitializeForNewLoop(new_preheader, lo);
+
+  // Generate loop exit check.
+  HVecPredWhile* pred_while =
+      new (global_allocator_) HVecPredWhile(global_allocator_,
+                                            phi,
+                                            hi,
+                                            HVecPredWhile::CondKind::kLO,
+                                            DataType::Type::kInt32,
+                                            vector_length_,
+                                            0u);
+
+  HInstruction* cond =
+     new (global_allocator_) HVecPredToBoolean(global_allocator_,
+                                               pred_while,
+                                               HVecPredToBoolean::PCondKind::kNFirst,
+                                               DataType::Type::kInt32,
+                                               vector_length_,
+                                               0u);
+
+  vector_header_->AddInstruction(pred_while);
+  vector_header_->AddInstruction(cond);
   vector_header_->AddInstruction(new (global_allocator_) HIf(cond));
-  vector_index_ = phi;
-  vector_permanent_map_->clear();  // preserved over unrolling
-  for (uint32_t u = 0; u < unroll; u++) {
-    // Generate instruction map.
-    vector_map_->clear();
-    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+
+  CreateEmptyPredicateInfoMap(node);
+  GenerateNewLoopBodyOnce(node, induc_type, step);
+  InitPredicateInfoMap(node, pred_while);
+
+  // Assign governing predicates for instructions in the loop.
+  //
+  // TODO: Adjust GVN to support VecPredSetAll sharing.
+  for (HBlocksInLoopIterator block_it(*node->loop_info);
+       !block_it.Done();
+       block_it.Advance()) {
+    HBasicBlock* cur_block = block_it.Current();
+
+    for (HInstructionIterator it(cur_block->GetInstructions()); !it.Done(); it.Advance()) {
+      auto i = vector_map_->find(it.Current());
+      if (i != vector_map_->end()) {
+        HInstruction* instr = i->second;
+        if (instr->IsVecOperation() &&
+            instr->GetBlock() == vector_body_ &&
+            !instr->AsVecOperation()->IsPredicated()) {
+          HVecOperation* op = instr->AsVecOperation();
+          HVecPredSetOperation* pred = predicate_info_map_->Get(cur_block)->GetControlPredicate();
+          op->SetMergingGoverningPredicate(pred);
+        }
+      }
+    }
+  }
+
+  FinalizePhisForNewLoop(phi, lo);
+}
+
+void HLoopOptimization::GenerateNewLoopBodyOnce(LoopNode* node,
+                                                DataType::Type induc_type,
+                                                HInstruction* step) {
+  // Generate instruction map.
+  vector_map_->clear();
+  HLoopInformation* loop_info = node->loop_info;
+  for (HBlocksInLoopIterator block_it(*loop_info);
+      !block_it.Done();
+      block_it.Advance()) {
+    HBasicBlock* cur_block = block_it.Current();
+
+    if (cur_block == loop_info->GetHeader()) {
+      continue;
+    }
+
+    for (HInstructionIterator it(cur_block->GetInstructions()); !it.Done(); it.Advance()) {
       bool vectorized_def = VectorizeDef(node, it.Current(), /*generate_code*/ true);
       DCHECK(vectorized_def);
     }
-    // Generate body from the instruction map, but in original program order.
-    HEnvironment* env = vector_header_->GetFirstInstruction()->GetEnvironment();
-    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+  }
+
+  // Generate body from the instruction map, but in original program order.
+  HEnvironment* env = vector_header_->GetFirstInstruction()->GetEnvironment();
+  for (HBlocksInLoopIterator block_it(*loop_info);
+        !block_it.Done();
+        block_it.Advance()) {
+    HBasicBlock* cur_block = block_it.Current();
+
+    if (cur_block == loop_info->GetHeader()) {
+      continue;
+    }
+
+    for (HInstructionIterator it(cur_block->GetInstructions()); !it.Done(); it.Advance()) {
       auto i = vector_map_->find(it.Current());
       if (i != vector_map_->end() && !i->second->IsInBlock()) {
         Insert(vector_body_, i->second);
-        if (IsInPredicatedVectorizationMode() && i->second->IsVecOperation()) {
-          HVecOperation* op = i->second->AsVecOperation();
-          op->SetMergingGoverningPredicate(set_pred);
-        }
         // Deal with instructions that need an environment, such as the scalar intrinsics.
         if (i->second->NeedsEnvironment()) {
           i->second->CopyEnvironmentFromWithLoopPhiAdjustment(env, vector_header_);
         }
       }
     }
-    // Generate the induction.
-    vector_index_ = new (global_allocator_) HAdd(induc_type, vector_index_, step);
-    Insert(vector_body_, vector_index_);
   }
+  // Generate the induction.
+  vector_index_ = new (global_allocator_) HAdd(induc_type, vector_index_, step);
+  Insert(vector_body_, vector_index_);
+}
+
+void HLoopOptimization::FinalizePhisForNewLoop(HPhi* phi, HInstruction* lo) {
   // Finalize phi inputs for the reductions (if any).
   for (auto i = reductions_->begin(); i != reductions_->end(); ++i) {
     if (!i->first->IsPhi()) {
@@ -1397,10 +1718,13 @@ bool HLoopOptimization::VectorizeDef(LoopNode* node,
         VectorizeDotProdIdiom(node, instruction, generate_code, type, restrictions) ||
         (TrySetVectorType(type, &restrictions) &&
          VectorizeUse(node, instruction, generate_code, type, restrictions))) {
+      DCHECK(!instruction->IsPhi());
       if (generate_code) {
-        HInstruction* new_red = vector_map_->Get(instruction);
-        vector_permanent_map_->Put(new_red, vector_map_->Get(redit->second));
-        vector_permanent_map_->Overwrite(redit->second, new_red);
+        HInstruction* new_red_vec_op = vector_map_->Get(instruction);
+        HInstruction* original_phi = redit->second;
+        DCHECK(original_phi->IsPhi());
+        vector_permanent_map_->Put(new_red_vec_op, vector_map_->Get(original_phi));
+        vector_permanent_map_->Overwrite(original_phi, new_red_vec_op);
       }
       return true;
     }
@@ -1409,6 +1733,10 @@ bool HLoopOptimization::VectorizeDef(LoopNode* node,
   // Branch back okay.
   if (instruction->IsGoto()) {
     return true;
+  }
+
+  if (instruction->IsIf()) {
+    return VectorizeIfCondition(node, instruction, generate_code, restrictions);
   }
   // Otherwise accept only expressions with no effects outside the immediate loop-body.
   // Note that actual uses are inspected during right-hand-side tree traversal.
@@ -1440,9 +1768,7 @@ bool HLoopOptimization::VectorizeUse(LoopNode* node,
     // Deal with vector restrictions.
     bool is_string_char_at = instruction->AsArrayGet()->IsStringCharAt();
 
-    if (is_string_char_at && (HasVectorRestrictions(restrictions, kNoStringCharAt) ||
-                              IsInPredicatedVectorizationMode())) {
-      // TODO: Support CharAt for predicated mode.
+    if (is_string_char_at && (HasVectorRestrictions(restrictions, kNoStringCharAt))) {
       return false;
     }
     // Accept a right-hand-side array base[index] for
@@ -1500,7 +1826,7 @@ bool HLoopOptimization::VectorizeUse(LoopNode* node,
            size_from >= size_vec &&
            VectorizeUse(node, opa, generate_code, type, restrictions))) {
         if (generate_code) {
-          if (vector_mode_ == kVector) {
+          if (synthesis_mode_ == LoopSynthesisMode::kVector) {
             vector_map_->Put(instruction, vector_map_->Get(opa));  // operand pass-through
           } else {
             GenerateVecOp(instruction, vector_map_->Get(opa), nullptr, type);
@@ -1576,7 +1902,7 @@ bool HLoopOptimization::VectorizeUse(LoopNode* node,
     // Accept shift operator for vectorizable/invariant operands.
     // TODO: accept symbolic, albeit loop invariant shift factors.
     DCHECK(r != nullptr);
-    if (generate_code && vector_mode_ != kVector) {  // de-idiom
+    if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
       r = opa;
     }
     int64_t distance = 0;
@@ -1604,7 +1930,7 @@ bool HLoopOptimization::VectorizeUse(LoopNode* node,
     }
     // Accept ABS(x) for vectorizable operand.
     DCHECK(r != nullptr);
-    if (generate_code && vector_mode_ != kVector) {  // de-idiom
+    if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
       r = opa;
     }
     if (VectorizeUse(node, r, generate_code, type, restrictions)) {
@@ -1621,7 +1947,9 @@ bool HLoopOptimization::VectorizeUse(LoopNode* node,
 }
 
 uint32_t HLoopOptimization::GetVectorSizeInBytes() {
-  return simd_register_size_;
+  return vectorization_mode_ == VectorizationMode::kPredicated ?
+         predicated_simd_register_size_ :
+         traditional_simd_register_size_;
 }
 
 bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrictions) {
@@ -1631,6 +1959,7 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
     case InstructionSet::kThumb2:
       // Allow vectorization for all ARM devices, because Android assumes that
       // ARM 32-bit always supports advanced SIMD (64-bit SIMD).
+      *restrictions |= kNoIfCond;
       switch (type) {
         case DataType::Type::kBool:
         case DataType::Type::kUint8:
@@ -1649,13 +1978,20 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
       }
       return false;
     case InstructionSet::kArm64:
-      if (IsInPredicatedVectorizationMode()) {
+      if (GetVectorizationMode() == VectorizationMode::kPredicated) {
         // SVE vectorization.
         CHECK(features->AsArm64InstructionSetFeatures()->HasSVE());
-        size_t vector_length = simd_register_size_ / DataType::Size(type);
-        DCHECK_EQ(simd_register_size_ % DataType::Size(type), 0u);
+        size_t vector_length = GetVectorSizeInBytes() / DataType::Size(type);
+        DCHECK_EQ(GetVectorSizeInBytes() % DataType::Size(type), 0u);
         switch (type) {
           case DataType::Type::kBool:
+            *restrictions |= kNoDiv |
+                             kNoSignedHAdd |
+                             kNoUnsignedHAdd |
+                             kNoUnroundedHAdd |
+                             kNoSAD |
+                             kNoIfCond;
+            return TrySetVectorLength(type, vector_length);
           case DataType::Type::kUint8:
           case DataType::Type::kInt8:
             *restrictions |= kNoDiv |
@@ -1667,6 +2003,7 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
           case DataType::Type::kUint16:
           case DataType::Type::kInt16:
             *restrictions |= kNoDiv |
+                             kNoStringCharAt |   // TODO: support in predicated mode.
                              kNoSignedHAdd |
                              kNoUnsignedHAdd |
                              kNoUnroundedHAdd |
@@ -1677,13 +2014,13 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
             *restrictions |= kNoDiv | kNoSAD;
             return TrySetVectorLength(type, vector_length);
           case DataType::Type::kInt64:
-            *restrictions |= kNoDiv | kNoSAD;
+            *restrictions |= kNoDiv | kNoSAD | kNoIfCond;
             return TrySetVectorLength(type, vector_length);
           case DataType::Type::kFloat32:
-            *restrictions |= kNoReduction;
+            *restrictions |= kNoReduction | kNoIfCond;
             return TrySetVectorLength(type, vector_length);
           case DataType::Type::kFloat64:
-            *restrictions |= kNoReduction;
+            *restrictions |= kNoReduction | kNoIfCond;
             return TrySetVectorLength(type, vector_length);
           default:
             break;
@@ -1692,6 +2029,7 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
       } else {
         // Allow vectorization for all ARM devices, because Android assumes that
         // ARMv8 AArch64 always supports advanced SIMD (128-bit SIMD).
+        *restrictions |= kNoIfCond;
         switch (type) {
           case DataType::Type::kBool:
           case DataType::Type::kUint8:
@@ -1722,6 +2060,7 @@ bool HLoopOptimization::TrySetVectorType(DataType::Type type, uint64_t* restrict
     case InstructionSet::kX86:
     case InstructionSet::kX86_64:
       // Allow vectorization for SSE4.1-enabled X86 devices only (128-bit SIMD).
+      *restrictions |= kNoIfCond;
       if (features->AsX86InstructionSetFeatures()->HasSSE4_1()) {
         switch (type) {
           case DataType::Type::kBool:
@@ -1789,7 +2128,7 @@ void HLoopOptimization::GenerateVecInv(HInstruction* org, DataType::Type type) {
   if (vector_map_->find(org) == vector_map_->end()) {
     // In scalar code, just use a self pass-through for scalar invariants
     // (viz. expression remains itself).
-    if (vector_mode_ == kSequential) {
+    if (synthesis_mode_ == LoopSynthesisMode::kSequential) {
       vector_map_->Put(org, org);
       return;
     }
@@ -1810,15 +2149,7 @@ void HLoopOptimization::GenerateVecInv(HInstruction* org, DataType::Type type) {
       vector = new (global_allocator_)
           HVecReplicateScalar(global_allocator_, input, type, vector_length_, kNoDexPc);
       vector_permanent_map_->Put(org, Insert(vector_preheader_, vector));
-      if (IsInPredicatedVectorizationMode()) {
-        HVecPredSetAll* set_pred = new (global_allocator_) HVecPredSetAll(global_allocator_,
-                                                                          graph_->GetIntConstant(1),
-                                                                          type,
-                                                                          vector_length_,
-                                                                          0u);
-        vector_preheader_->InsertInstructionBefore(set_pred, vector);
-        vector->AsVecOperation()->SetMergingGoverningPredicate(set_pred);
-      }
+      vector_external_set_->insert(vector);
     }
     vector_map_->Put(org, vector);
   }
@@ -1845,7 +2176,7 @@ void HLoopOptimization::GenerateVecMem(HInstruction* org,
                                        DataType::Type type) {
   uint32_t dex_pc = org->GetDexPc();
   HInstruction* vector = nullptr;
-  if (vector_mode_ == kVector) {
+  if (synthesis_mode_ == LoopSynthesisMode::kVector) {
     // Vector store or load.
     bool is_string_char_at = false;
     HInstruction* base = org->InputAt(0);
@@ -1877,7 +2208,7 @@ void HLoopOptimization::GenerateVecMem(HInstruction* org,
     }
   } else {
     // Scalar store or load.
-    DCHECK(vector_mode_ == kSequential);
+    DCHECK(synthesis_mode_ == LoopSynthesisMode::kSequential);
     if (opb != nullptr) {
       DataType::Type component_type = org->AsArraySet()->GetComponentType();
       vector = new (global_allocator_) HArraySet(
@@ -1891,18 +2222,18 @@ void HLoopOptimization::GenerateVecMem(HInstruction* org,
   vector_map_->Put(org, vector);
 }
 
-void HLoopOptimization::GenerateVecReductionPhi(HPhi* phi) {
-  DCHECK(reductions_->find(phi) != reductions_->end());
-  DCHECK(reductions_->Get(phi->InputAt(1)) == phi);
+void HLoopOptimization::GenerateVecReductionPhi(HPhi* orig_phi) {
+  DCHECK(reductions_->find(orig_phi) != reductions_->end());
+  DCHECK(reductions_->Get(orig_phi->InputAt(1)) == orig_phi);
   HInstruction* vector = nullptr;
-  if (vector_mode_ == kSequential) {
+  if (synthesis_mode_ == LoopSynthesisMode::kSequential) {
     HPhi* new_phi = new (global_allocator_) HPhi(
-        global_allocator_, kNoRegNumber, 0, phi->GetType());
+        global_allocator_, kNoRegNumber, 0, orig_phi->GetType());
     vector_header_->AddPhi(new_phi);
     vector = new_phi;
   } else {
     // Link vector reduction back to prior unrolled update, or a first phi.
-    auto it = vector_permanent_map_->find(phi);
+    auto it = vector_permanent_map_->find(orig_phi);
     if (it != vector_permanent_map_->end()) {
       vector = it->second;
     } else {
@@ -1912,7 +2243,7 @@ void HLoopOptimization::GenerateVecReductionPhi(HPhi* phi) {
       vector = new_phi;
     }
   }
-  vector_map_->Put(phi, vector);
+  vector_map_->Put(orig_phi, vector);
 }
 
 void HLoopOptimization::GenerateVecReductionPhiInputs(HPhi* phi, HInstruction* reduction) {
@@ -1924,7 +2255,7 @@ void HLoopOptimization::GenerateVecReductionPhiInputs(HPhi* phi, HInstruction* r
     DCHECK(new_phi->IsVecOperation());
   }
   // Prepare the new initialization.
-  if (vector_mode_ == kVector) {
+  if (synthesis_mode_ == LoopSynthesisMode::kVector) {
     // Generate a [initial, 0, .., 0] vector for add or
     // a [initial, initial, .., initial] vector for min/max.
     HVecOperation* red_vector = new_red->AsVecOperation();
@@ -1947,15 +2278,7 @@ void HLoopOptimization::GenerateVecReductionPhiInputs(HPhi* phi, HInstruction* r
                                                                     vector_length,
                                                                     kNoDexPc));
     }
-    if (IsInPredicatedVectorizationMode()) {
-      HVecPredSetAll* set_pred = new (global_allocator_) HVecPredSetAll(global_allocator_,
-                                                                        graph_->GetIntConstant(1),
-                                                                        type,
-                                                                        vector_length,
-                                                                        0u);
-      vector_preheader_->InsertInstructionBefore(set_pred, new_init);
-      new_init->AsVecOperation()->SetMergingGoverningPredicate(set_pred);
-    }
+    vector_external_set_->insert(new_init);
   } else {
     new_init = ReduceAndExtractIfNeeded(new_init);
   }
@@ -1984,38 +2307,29 @@ HInstruction* HLoopOptimization::ReduceAndExtractIfNeeded(HInstruction* instruct
       HInstruction* reduce = new (global_allocator_) HVecReduce(
           global_allocator_, instruction, type, vector_length, kind, kNoDexPc);
       exit->InsertInstructionBefore(reduce, exit->GetFirstInstruction());
+      vector_external_set_->insert(reduce);
       instruction = new (global_allocator_) HVecExtractScalar(
           global_allocator_, reduce, type, vector_length, 0, kNoDexPc);
       exit->InsertInstructionAfter(instruction, reduce);
-
-      if (IsInPredicatedVectorizationMode()) {
-        HVecPredSetAll* set_pred = new (global_allocator_) HVecPredSetAll(global_allocator_,
-                                                                          graph_->GetIntConstant(1),
-                                                                          type,
-                                                                          vector_length,
-                                                                          0u);
-        exit->InsertInstructionBefore(set_pred, reduce);
-        reduce->AsVecOperation()->SetMergingGoverningPredicate(set_pred);
-        instruction->AsVecOperation()->SetMergingGoverningPredicate(set_pred);
-      }
+      vector_external_set_->insert(instruction);
     }
   }
   return instruction;
 }
 
 #define GENERATE_VEC(x, y) \
-  if (vector_mode_ == kVector) { \
+  if (synthesis_mode_ == LoopSynthesisMode::kVector) { \
     vector = (x); \
   } else { \
-    DCHECK(vector_mode_ == kSequential); \
+    DCHECK(synthesis_mode_ == LoopSynthesisMode::kSequential); \
     vector = (y); \
   } \
   break;
 
-void HLoopOptimization::GenerateVecOp(HInstruction* org,
-                                      HInstruction* opa,
-                                      HInstruction* opb,
-                                      DataType::Type type) {
+HInstruction* HLoopOptimization::GenerateVecOp(HInstruction* org,
+                                               HInstruction* opa,
+                                               HInstruction* opb,
+                                               DataType::Type type) {
   uint32_t dex_pc = org->GetDexPc();
   HInstruction* vector = nullptr;
   DataType::Type org_type = org->GetType();
@@ -2085,11 +2399,23 @@ void HLoopOptimization::GenerateVecOp(HInstruction* org,
       GENERATE_VEC(
         new (global_allocator_) HVecAbs(global_allocator_, opa, type, vector_length_, dex_pc),
         new (global_allocator_) HAbs(org_type, opa, dex_pc));
+    case HInstruction::kEqual: {
+        // Special case.
+        if (synthesis_mode_ == LoopSynthesisMode::kVector) {
+          vector = new (global_allocator_) HVecCondition(
+              global_allocator_, opa, opb, type, vector_length_, dex_pc);
+        } else {
+          DCHECK(synthesis_mode_ == LoopSynthesisMode::kSequential);
+          UNREACHABLE();
+        }
+      }
+      break;
     default:
       break;
   }  // switch
   CHECK(vector != nullptr) << "Unsupported SIMD operator";
   vector_map_->Put(org, vector);
+  return vector;
 }
 
 #undef GENERATE_VEC
@@ -2145,14 +2471,14 @@ bool HLoopOptimization::VectorizeHalvingAddIdiom(LoopNode* node,
       // Accept recognized halving add for vectorizable operands. Vectorized code uses the
       // shorthand idiomatic operation. Sequential code uses the original scalar expressions.
       DCHECK(r != nullptr && s != nullptr);
-      if (generate_code && vector_mode_ != kVector) {  // de-idiom
+      if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
         r = instruction->InputAt(0);
         s = instruction->InputAt(1);
       }
       if (VectorizeUse(node, r, generate_code, type, restrictions) &&
           VectorizeUse(node, s, generate_code, type, restrictions)) {
         if (generate_code) {
-          if (vector_mode_ == kVector) {
+          if (synthesis_mode_ == LoopSynthesisMode::kVector) {
             vector_map_->Put(instruction, new (global_allocator_) HVecHalvingAdd(
                 global_allocator_,
                 vector_map_->Get(r),
@@ -2221,14 +2547,14 @@ bool HLoopOptimization::VectorizeSADIdiom(LoopNode* node,
   // Accept SAD idiom for vectorizable operands. Vectorized code uses the shorthand
   // idiomatic operation. Sequential code uses the original scalar expressions.
   DCHECK(r != nullptr && s != nullptr);
-  if (generate_code && vector_mode_ != kVector) {  // de-idiom
+  if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
     r = s = abs->InputAt(0);
   }
   if (VectorizeUse(node, acc, generate_code, sub_type, restrictions) &&
       VectorizeUse(node, r, generate_code, sub_type, restrictions) &&
       VectorizeUse(node, s, generate_code, sub_type, restrictions)) {
     if (generate_code) {
-      if (vector_mode_ == kVector) {
+      if (synthesis_mode_ == LoopSynthesisMode::kVector) {
         vector_map_->Put(instruction, new (global_allocator_) HVecSADAccumulate(
             global_allocator_,
             vector_map_->Get(acc),
@@ -2294,7 +2620,7 @@ bool HLoopOptimization::VectorizeDotProdIdiom(LoopNode* node,
   DCHECK(r != nullptr && s != nullptr);
   // Accept dot product idiom for vectorizable operands. Vectorized code uses the shorthand
   // idiomatic operation. Sequential code uses the original scalar expressions.
-  if (generate_code && vector_mode_ != kVector) {  // de-idiom
+  if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
     r = mul_left;
     s = mul_right;
   }
@@ -2302,7 +2628,7 @@ bool HLoopOptimization::VectorizeDotProdIdiom(LoopNode* node,
       VectorizeUse(node, r, generate_code, op_type, restrictions) &&
       VectorizeUse(node, s, generate_code, op_type, restrictions)) {
     if (generate_code) {
-      if (vector_mode_ == kVector) {
+      if (synthesis_mode_ == LoopSynthesisMode::kVector) {
         vector_map_->Put(instruction, new (global_allocator_) HVecDotProd(
             global_allocator_,
             vector_map_->Get(acc),
@@ -2326,6 +2652,89 @@ bool HLoopOptimization::VectorizeDotProdIdiom(LoopNode* node,
     }
     return true;
   }
+  return false;
+}
+
+bool HLoopOptimization::VectorizeIfCondition(LoopNode* node,
+                                             HInstruction* hif,
+                                             bool generate_code,
+                                             uint64_t restrictions) {
+  DCHECK(hif->IsIf());
+  HInstruction* if_input = hif->InputAt(0);
+
+  if (!if_input->HasOnlyOneNonEnvironmentUse()) {
+    // Avoid the complications of the condition used as materialized boolean.
+    return false;
+  }
+
+  if (!if_input->IsEqual()) {
+    // TODO: Support other condition types.
+    return false;
+  }
+
+  HCondition* cond = if_input->AsCondition();
+  HInstruction* opa = cond->InputAt(0);
+  HInstruction* opb = cond->InputAt(1);
+  DataType::Type type = GetNarrowerType(opa, opb);
+
+  if (!DataType::IsIntegralType(type)) {
+    return false;
+  }
+
+  bool is_unsigned = false;
+  HInstruction* opa_promoted = opa;
+  HInstruction* opb_promoted = opb;
+  bool is_int_case = DataType::Type::kInt32 == opa->GetType() &&
+                     DataType::Type::kInt32 == opa->GetType();
+
+  // Condition arguments should be either both int32 or consistently extended signed/unsigned
+  // narrower operands.
+  if (!is_int_case &&
+      !IsNarrowerOperands(opa, opb, type, &opa_promoted, &opb_promoted, &is_unsigned)) {
+    return false;
+  }
+  type = HVecOperation::ToProperType(type, is_unsigned);
+
+  // For narrow types, explicit type conversion may have been
+  // optimized way, so set the no hi bits restriction here.
+  if (DataType::Size(type) <= 2) {
+    restrictions |= kNoHiBits;
+  }
+
+  if (!TrySetVectorType(type, &restrictions) ||
+      HasVectorRestrictions(restrictions, kNoIfCond)) {
+    return false;
+  }
+
+  if (generate_code && synthesis_mode_ != LoopSynthesisMode::kVector) {  // de-idiom
+    opa_promoted = opa;
+    opb_promoted = opb;
+  }
+
+  if (VectorizeUse(node, opa_promoted, generate_code, type, restrictions) &&
+      VectorizeUse(node, opb_promoted, generate_code, type, restrictions)) {
+    if (generate_code) {
+      HInstruction* vec_cond = GenerateVecOp(cond,
+                                             vector_map_->Get(opa_promoted),
+                                             vector_map_->Get(opb_promoted),
+                                             type);
+
+      if (synthesis_mode_ == LoopSynthesisMode::kVector) {
+          HInstruction* vec_pred_not = new (global_allocator_) HVecPredNot(
+              global_allocator_, vec_cond, type, vector_length_, hif->GetDexPc());
+
+          vector_map_->Put(hif, vec_pred_not);
+          BlockPredicateInfo* pred_info = predicate_info_map_->Get(hif->GetBlock());
+          pred_info->SetControlFlowInfo(vec_cond->AsVecPredSetOperation(),
+                                        vec_pred_not->AsVecPredSetOperation());
+        } else {
+          DCHECK(synthesis_mode_ == LoopSynthesisMode::kSequential);
+          UNREACHABLE();
+      }
+    }
+    return true;
+  }
+
   return false;
 }
 
@@ -2372,12 +2781,12 @@ uint32_t HLoopOptimization::MaxNumberPeeled() {
   return vector_static_peeling_factor_;  // known exactly
 }
 
-bool HLoopOptimization::IsVectorizationProfitable(int64_t trip_count) {
+bool HLoopOptimization::IsVectorizationProfitable(int64_t trip_count, bool try_peeling) {
   // Current heuristic: non-empty body with sufficient number of iterations (if known).
   // TODO: refine by looking at e.g. operation count, alignment, etc.
   // TODO: trip count is really unsigned entity, provided the guarding test
   //       is satisfied; deal with this more carefully later
-  uint32_t max_peel = MaxNumberPeeled();
+  uint32_t max_peel = try_peeling ? MaxNumberPeeled() : 0u;
   if (vector_length_ == 0) {
     return false;  // nothing found
   } else if (trip_count < 0) {
@@ -2639,6 +3048,69 @@ bool HLoopOptimization::CanRemoveCycle() {
     }
   }
   return true;
+}
+
+void HLoopOptimization::CreateEmptyPredicateInfoMap(LoopNode* node) {
+  HLoopInformation* loop_info = node->loop_info;
+
+  DCHECK(IsPredicatedLoopControlFlowSupported(loop_info));
+
+  for (HBlocksInLoopIterator block_it(*loop_info);
+      !block_it.Done();
+      block_it.Advance()) {
+    HBasicBlock* cur_block = block_it.Current();
+    BlockPredicateInfo* pred_info = new (loop_allocator_) BlockPredicateInfo();
+
+    predicate_info_map_->Put(cur_block, pred_info);
+  }
+}
+
+void HLoopOptimization::InitPredicateInfoMap(LoopNode* node,
+                                             HVecPredSetOperation* loop_main_pred) {
+  HLoopInformation* loop_info = node->loop_info;
+  HBasicBlock* header = loop_info->GetHeader();
+  BlockPredicateInfo* header_info = predicate_info_map_->Get(header);
+  // Loop header is a special case; it doesn't have a false predicate because we
+  // would just exit the loop then.
+  header_info->SetControlFlowInfo(loop_main_pred, loop_main_pred);
+
+  size_t blocks_in_loop = header->GetLoopInformation()->GetBlocks().NumSetBits();
+  if (blocks_in_loop == 2) {
+    for (HBasicBlock* successor : header->GetSuccessors()) {
+      if (loop_info->Contains(*successor)) {
+        // This is loop second block - body.
+        BlockPredicateInfo* body_info = predicate_info_map_->Get(successor);
+        body_info->SetControlPredicate(loop_main_pred);
+        return;
+      }
+    }
+    UNREACHABLE();
+  }
+
+  // TODO: support predicated vectorization of CF loop of more complex structure.
+  DCHECK(HasLoopDiamondStructure(loop_info));
+  HBasicBlock* header_succ_0 = header->GetSuccessors()[0];
+  HBasicBlock* header_succ_1 = header->GetSuccessors()[1];
+  HBasicBlock* diamond_top = loop_info->Contains(*header_succ_0) ?
+                             header_succ_0 :
+                             header_succ_1;
+
+  HIf* diamond_hif = diamond_top->GetLastInstruction()->AsIf();
+  HBasicBlock* diamond_true = diamond_hif->IfTrueSuccessor();
+  HBasicBlock* diamond_false = diamond_hif->IfFalseSuccessor();
+  HBasicBlock* back_edge = diamond_true->GetSingleSuccessor();
+
+  BlockPredicateInfo* diamond_top_info = predicate_info_map_->Get(diamond_top);
+  BlockPredicateInfo* diamond_true_info = predicate_info_map_->Get(diamond_true);
+  BlockPredicateInfo* diamond_false_info = predicate_info_map_->Get(diamond_false);
+  BlockPredicateInfo* back_edge_info = predicate_info_map_->Get(back_edge);
+
+  diamond_top_info->SetControlPredicate(header_info->GetTruePredicate());
+
+  diamond_true_info->SetControlPredicate(diamond_top_info->GetTruePredicate());
+  diamond_false_info->SetControlPredicate(diamond_top_info->GetFalsePredicate());
+
+  back_edge_info->SetControlPredicate(header_info->GetTruePredicate());
 }
 
 }  // namespace art
