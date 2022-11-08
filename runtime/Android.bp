@@ -37,6 +37,12 @@ JIT_DEBUG_REGISTER_CODE_LDFLAGS = [
 libart_cc_defaults {
     name: "libart_nativeunwind_defaults",
     target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
         android_arm: {
             // Arm 32 bit does not produce complete exidx unwind information
             // so keep the .debug_frame which is relatively small and does
@@ -142,6 +148,7 @@ libart_cc_defaults {
         "gc/collector/garbage_collector.cc",
         "gc/collector/immune_region.cc",
         "gc/collector/immune_spaces.cc",
+        "gc/collector/mark_compact.cc",
         "gc/collector/mark_sweep.cc",
         "gc/collector/partial_mark_sweep.cc",
         "gc/collector/semi_space.cc",
@@ -439,6 +446,10 @@ libart_cc_defaults {
                 "runtime_linux.cc",
                 "thread_linux.cc",
             ],
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
             shared_libs: [
                 "libz", // For adler32.
             ],
@@ -509,6 +520,12 @@ libart_static_cc_defaults {
         "libz",
     ],
     target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
         bionic: {
             whole_static_libs: [
                 "libasync_safe", // libunwindstack dependency on Bionic.
@@ -588,6 +605,7 @@ gensrcs {
 
 // Properties common to `libart` and `libart-broken`.
 art_cc_defaults {
+    cflags: ["-O3"],
     name: "libart_common_defaults",
     defaults: [
         "libart_defaults",
@@ -642,6 +660,7 @@ art_cc_test_library {
 // Debug version of the ART runtime library.
 art_cc_library {
     name: "libartd",
+    cflags: ["-O3"],
     defaults: [
         "art_debug_defaults",
         "libart_defaults",
@@ -670,6 +689,14 @@ art_cc_library {
 
 art_cc_defaults {
     name: "libart-runtime-gtest-defaults",
+    target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
+    },
     tidy_timeout_srcs: [
         "common_runtime_test.cc",
     ],
@@ -690,6 +717,7 @@ art_cc_defaults {
 
 art_cc_library {
     name: "libart-runtime-gtest",
+    cflags: ["-O3"],
     defaults: [
         "libart-runtime-gtest-defaults",
         "libart-gtest-defaults",
@@ -714,6 +742,14 @@ art_cc_library {
 
 art_cc_defaults {
     name: "art_runtime_tests_defaults",
+    target: {
+        host: {
+            cflags: [
+                "-fsanitize-address-use-after-return=never",
+                "-Wno-unused-command-line-argument",
+            ],
+        },
+    },
     data: [
         ":art-gtest-jars-AllFields",
         ":art-gtest-jars-ErroneousA",
@@ -817,6 +853,7 @@ art_cc_defaults {
         "intern_table_test.cc",
         "interpreter/safe_math_test.cc",
         "interpreter/unstarted_runtime_test.cc",
+        "jit/jit_load_test.cc",
         "jit/jit_memory_region_test.cc",
         "jit/profile_saver_test.cc",
         "jit/profiling_info_test.cc",
@@ -859,6 +896,7 @@ art_cc_defaults {
 // TODO(b/192274705): Remove this module when the migration to standalone ART gtests is complete.
 art_cc_test {
     name: "art_runtime_tests",
+    cflags: ["-O3"],
     defaults: [
         "art_gtest_defaults",
         "art_runtime_tests_defaults",
@@ -908,6 +946,7 @@ art_cc_defaults {
 // TODO(b/192274705): Remove this module when the migration to standalone ART gtests is complete.
 art_cc_test {
     name: "art_runtime_compiler_tests",
+    cflags: ["-O3"],
     defaults: [
         "art_gtest_defaults",
         "art_runtime_compiler_tests_defaults",

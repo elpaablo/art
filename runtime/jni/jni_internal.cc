@@ -37,6 +37,7 @@
 #include "dex/dex_file-inl.h"
 #include "dex/utf-inl.h"
 #include "fault_handler.h"
+#include "handle_scope.h"
 #include "hidden_api.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc_root.h"
@@ -2176,14 +2177,13 @@ class JNI {
       if (heap->IsMovableObject(s)) {
         StackHandleScope<1> hs(soa.Self());
         HandleWrapperObjPtr<mirror::String> h(hs.NewHandleWrapper(&s));
-        if (!kUseReadBarrier) {
-          heap->IncrementDisableMovingGC(soa.Self());
-        } else {
-          // For the CC collector, we only need to wait for the thread flip rather
-          // than the whole GC to occur thanks to the to-space invariant.
-          heap->IncrementDisableThreadFlip(soa.Self());
-        }
+        // For the CC and CMC collector, we only need to wait for the thread flip rather
+        // than the whole GC to occur thanks to the to-space invariant.
+        heap->IncrementDisableThreadFlip(soa.Self());
       }
+      // Ensure that the string doesn't cause userfaults in case passed on to
+      // the kernel.
+      heap->EnsureObjectUserfaulted(s);
       if (is_copy != nullptr) {
         *is_copy = JNI_FALSE;
       }
@@ -2199,11 +2199,7 @@ class JNI {
     gc::Heap* heap = Runtime::Current()->GetHeap();
     ObjPtr<mirror::String> s = soa.Decode<mirror::String>(java_string);
     if (!s->IsCompressed() && heap->IsMovableObject(s)) {
-      if (!kUseReadBarrier) {
-        heap->DecrementDisableMovingGC(soa.Self());
-      } else {
-        heap->DecrementDisableThreadFlip(soa.Self());
-      }
+      heap->DecrementDisableThreadFlip(soa.Self());
     }
     // TODO: For uncompressed strings GetStringCritical() always returns `s->GetValue()`.
     // Should we report an error if the user passes a different `chars`?
@@ -2366,16 +2362,14 @@ class JNI {
     }
     gc::Heap* heap = Runtime::Current()->GetHeap();
     if (heap->IsMovableObject(array)) {
-      if (!kUseReadBarrier) {
-        heap->IncrementDisableMovingGC(soa.Self());
-      } else {
-        // For the CC collector, we only need to wait for the thread flip rather than the whole GC
-        // to occur thanks to the to-space invariant.
-        heap->IncrementDisableThreadFlip(soa.Self());
-      }
+      // For the CC and CMC collector, we only need to wait for the thread flip rather
+      // than the whole GC to occur thanks to the to-space invariant.
+      heap->IncrementDisableThreadFlip(soa.Self());
       // Re-decode in case the object moved since IncrementDisableGC waits for GC to complete.
       array = soa.Decode<mirror::Array>(java_array);
     }
+    // Ensure that the array doesn't cause userfaults in case passed on to the kernel.
+    heap->EnsureObjectUserfaulted(array);
     if (is_copy != nullptr) {
       *is_copy = JNI_FALSE;
     }
@@ -2784,14 +2778,20 @@ class JNI {
       return nullptr;
     }
 
+    ScopedObjectAccess soa(env);
+    ObjPtr<mirror::Object> buffer = soa.Decode<mirror::Object>(java_buffer);
+    ObjPtr<mirror::Class> java_nio_Buffer =
+       soa.Decode<mirror::Class>(WellKnownClasses::java_nio_Buffer);
+    DCHECK(java_nio_Buffer != nullptr);
+
     // Return null if |java_buffer| is not a java.nio.Buffer instance.
-    if (!IsInstanceOf(env, java_buffer, WellKnownClasses::java_nio_Buffer)) {
+    if (!buffer->InstanceOf(java_nio_Buffer)) {
       return nullptr;
     }
 
     // Buffer.address is non-null when the |java_buffer| is direct.
-    return reinterpret_cast<void*>(env->GetLongField(
-        java_buffer, WellKnownClasses::java_nio_Buffer_address));
+    return reinterpret_cast<void*>(
+        WellKnownClasses::java_nio_Buffer_address->GetLong(buffer));
   }
 
   static jlong GetDirectBufferCapacity(JNIEnv* env, jobject java_buffer) {
@@ -2799,7 +2799,14 @@ class JNI {
       return -1;
     }
 
-    if (!IsInstanceOf(env, java_buffer, WellKnownClasses::java_nio_Buffer)) {
+    ScopedObjectAccess soa(env);
+    StackHandleScope<2u> hs(soa.Self());
+    Handle<mirror::Object> buffer = hs.NewHandle(soa.Decode<mirror::Object>(java_buffer));
+    Handle<mirror::Class> java_nio_Buffer =
+       hs.NewHandle(soa.Decode<mirror::Class>(WellKnownClasses::java_nio_Buffer));
+    DCHECK(java_nio_Buffer != nullptr);
+
+    if (!buffer->InstanceOf(java_nio_Buffer.Get())) {
       return -1;
     }
 
@@ -2816,8 +2823,7 @@ class JNI {
       return -1;
     }
 
-    return static_cast<jlong>(env->GetIntField(
-        java_buffer, WellKnownClasses::java_nio_Buffer_capacity));
+    return static_cast<jlong>(WellKnownClasses::java_nio_Buffer_capacity->GetInt(buffer.Get()));
   }
 
   static jobjectRefType GetObjectRefType(JNIEnv* env ATTRIBUTE_UNUSED, jobject java_object) {
@@ -2967,11 +2973,7 @@ class JNI {
         delete[] reinterpret_cast<uint64_t*>(elements);
       } else if (heap->IsMovableObject(array)) {
         // Non copy to a movable object must means that we had disabled the moving GC.
-        if (!kUseReadBarrier) {
-          heap->DecrementDisableMovingGC(soa.Self());
-        } else {
-          heap->DecrementDisableThreadFlip(soa.Self());
-        }
+        heap->DecrementDisableThreadFlip(soa.Self());
       }
     }
   }

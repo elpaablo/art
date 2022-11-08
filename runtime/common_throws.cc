@@ -238,6 +238,19 @@ void ThrowIllegalAccessError(ObjPtr<mirror::Class> referrer, const char* fmt, ..
   va_end(args);
 }
 
+void ThrowIllegalAccessErrorForImplementingMethod(ObjPtr<mirror::Class> klass,
+                                                  ArtMethod* implementation_method,
+                                                  ArtMethod* interface_method)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(!implementation_method->IsAbstract());
+  DCHECK(!implementation_method->IsPublic());
+  ThrowIllegalAccessError(
+      klass,
+      "Method '%s' implementing interface method '%s' is not public",
+      implementation_method->PrettyMethod().c_str(),
+      interface_method->PrettyMethod().c_str());
+}
+
 // IllegalAccessException
 
 void ThrowIllegalAccessException(const char* msg) {
@@ -437,7 +450,7 @@ void ThrowNullPointerExceptionForMethodAccess(ArtMethod* method, InvokeType type
 }
 
 static bool IsValidReadBarrierImplicitCheck(uintptr_t addr) {
-  DCHECK(kEmitCompilerReadBarrier);
+  DCHECK(gUseReadBarrier);
   uint32_t monitor_offset = mirror::Object::MonitorOffset().Uint32Value();
   if (kUseBakerReadBarrier &&
       (kRuntimeISA == InstructionSet::kX86 || kRuntimeISA == InstructionSet::kX86_64)) {
@@ -472,7 +485,7 @@ static bool IsValidImplicitCheck(uintptr_t addr, const Instruction& instr)
     }
 
     case Instruction::IGET_OBJECT:
-      if (kEmitCompilerReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
+      if (gUseReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
         return true;
       }
       FALLTHROUGH_INTENDED;
@@ -496,7 +509,7 @@ static bool IsValidImplicitCheck(uintptr_t addr, const Instruction& instr)
     }
 
     case Instruction::AGET_OBJECT:
-      if (kEmitCompilerReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
+      if (gUseReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
         return true;
       }
       FALLTHROUGH_INTENDED;

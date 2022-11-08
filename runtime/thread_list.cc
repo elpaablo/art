@@ -28,6 +28,7 @@
 #include "nativehelper/scoped_local_ref.h"
 #include "nativehelper/scoped_utf_chars.h"
 
+#include "art_field-inl.h"
 #include "base/aborting.h"
 #include "base/histogram-inl.h"
 #include "base/mutex-inl.h"
@@ -42,8 +43,10 @@
 #include "gc_root.h"
 #include "jni/jni_internal.h"
 #include "lock_word.h"
+#include "mirror/string.h"
 #include "monitor.h"
 #include "native_stack_dump.h"
+#include "obj_ptr-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
 #include "trace.h"
@@ -101,12 +104,11 @@ void ThreadList::ShutDown() {
     Runtime::Current()->DetachCurrentThread();
   }
   WaitForOtherNonDaemonThreadsToExit();
-  // Disable GC and wait for GC to complete in case there are still daemon threads doing
-  // allocations.
+  // The only caller of this function, ~Runtime, has already disabled GC and
+  // ensured that the last GC is finished.
   gc::Heap* const heap = Runtime::Current()->GetHeap();
-  heap->DisableGCForShutdown();
-  // In case a GC is in progress, wait for it to finish.
-  heap->WaitForGcToComplete(gc::kGcCauseBackground, Thread::Current());
+  CHECK(heap->IsGCDisabledForShutdown());
+
   // TODO: there's an unaddressed race here where a thread may attach during shutdown, see
   //       Thread::Init.
   SuspendAllDaemonThreadsForShutdown();
@@ -851,20 +853,16 @@ bool ThreadList::Resume(Thread* thread, SuspendReason reason) {
   return true;
 }
 
-static void ThreadSuspendByPeerWarning(Thread* self,
+static void ThreadSuspendByPeerWarning(ScopedObjectAccess& soa,
                                        LogSeverity severity,
                                        const char* message,
-                                       jobject peer) {
-  JNIEnvExt* env = self->GetJniEnv();
-  ScopedLocalRef<jstring>
-      scoped_name_string(env, static_cast<jstring>(env->GetObjectField(
-          peer, WellKnownClasses::java_lang_Thread_name)));
-  ScopedUtfChars scoped_name_chars(env, scoped_name_string.get());
-  if (scoped_name_chars.c_str() == nullptr) {
-      LOG(severity) << message << ": " << peer;
-      env->ExceptionClear();
+                                       jobject peer) REQUIRES_SHARED(Locks::mutator_lock_) {
+  ObjPtr<mirror::Object> name =
+      WellKnownClasses::java_lang_Thread_name->GetObject(soa.Decode<mirror::Object>(peer));
+  if (name == nullptr) {
+    LOG(severity) << message << ": " << peer;
   } else {
-      LOG(severity) << message << ": " << peer << ":" << scoped_name_chars.c_str();
+    LOG(severity) << message << ": " << peer << ":" << name->AsString()->ToModifiedUtf8();
   }
 }
 
@@ -902,7 +900,7 @@ Thread* ThreadList::SuspendThreadByPeer(jobject peer,
                                                               reason);
           DCHECK(updated);
         }
-        ThreadSuspendByPeerWarning(self,
+        ThreadSuspendByPeerWarning(soa,
                                    ::android::base::WARNING,
                                     "No such thread for suspend",
                                     peer);
@@ -955,7 +953,7 @@ Thread* ThreadList::SuspendThreadByPeer(jobject peer,
         const uint64_t total_delay = NanoTime() - start_time;
         if (total_delay >= thread_suspend_timeout_ns_) {
           if (suspended_thread == nullptr) {
-            ThreadSuspendByPeerWarning(self,
+            ThreadSuspendByPeerWarning(soa,
                                        ::android::base::FATAL,
                                        "Failed to issue suspend request",
                                        peer);
@@ -967,7 +965,7 @@ Thread* ThreadList::SuspendThreadByPeer(jobject peer,
             // Explicitly release thread_suspend_count_lock_; we haven't held it for long, so
             // seeing threads blocked on it is not informative.
             Locks::thread_suspend_count_lock_->Unlock(self);
-            ThreadSuspendByPeerWarning(self,
+            ThreadSuspendByPeerWarning(soa,
                                        ::android::base::FATAL,
                                        "Thread suspension timed out",
                                        peer);
@@ -1275,7 +1273,7 @@ void ThreadList::Register(Thread* self) {
   }
   CHECK(!Contains(self));
   list_.push_back(self);
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     gc::collector::ConcurrentCopying* const cc =
         Runtime::Current()->GetHeap()->ConcurrentCopyingCollector();
     // Initialize according to the state of the CC collector.
@@ -1287,10 +1285,14 @@ void ThreadList::Register(Thread* self) {
   }
 }
 
-void ThreadList::Unregister(Thread* self) {
+void ThreadList::Unregister(Thread* self, bool should_run_callbacks) {
   DCHECK_EQ(self, Thread::Current());
   CHECK_NE(self->GetState(), ThreadState::kRunnable);
   Locks::mutator_lock_->AssertNotHeld(self);
+  if (self->tls32_.disable_thread_flip_count != 0) {
+    LOG(FATAL) << "Incomplete PrimitiveArrayCritical section at exit: " << *self << "count = "
+               << self->tls32_.disable_thread_flip_count;
+  }
 
   VLOG(threads) << "ThreadList::Unregister() " << *self;
 
@@ -1304,7 +1306,7 @@ void ThreadList::Unregister(Thread* self) {
   // causes the threads to join. It is important to do this after incrementing unregistering_count_
   // since we want the runtime to wait for the daemon threads to exit before deleting the thread
   // list.
-  self->Destroy();
+  self->Destroy(should_run_callbacks);
 
   // If tracing, remember thread id and name before thread exits.
   Trace::StoreExitingThreadInfo(self);
@@ -1411,6 +1413,13 @@ void ThreadList::VisitReflectiveTargets(ReflectiveValueVisitor *visitor) const {
   MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
   for (const auto& thread : list_) {
     thread->VisitReflectiveTargets(visitor);
+  }
+}
+
+void ThreadList::SweepInterpreterCaches(IsMarkedVisitor* visitor) const {
+  MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
+  for (const auto& thread : list_) {
+    thread->SweepInterpreterCache(visitor);
   }
 }
 
